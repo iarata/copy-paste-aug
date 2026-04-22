@@ -1,0 +1,21 @@
+defaults:
+  - base_training
+  - _self_
+
+mode: fit
+epochs: 100
+accelerator: auto
+devices: "auto"
+precision: auto
+accumulate_grad_batches: 1
+gradient_clip_val: 0.0
+optimizer: auto
+lr0: 0.01
+momentum: 0.937
+weight_decay: 0.0005
+lrf: 0.01
+cos_lr: true
+log_every_n_steps: 20
+limit_train_batches: 1.0
+limit_val_batches: 1.0
+resume_from_checkpoint: null

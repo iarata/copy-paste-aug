@@ -1,0 +1,20 @@
+defaults:
+  - base_config
+  - dataset: default
+  - models: default
+  - training: default
+  - evaluation: default
+  - _self_
+
+seed: 42
+experiment_name: null
+
+wandb:
+  project: copy-paste-augmentation
+  entity: null
+  group: null
+  tags: null
+  mode: online
+  log_model: false
+
+debug: false

@@ -1,0 +1,14 @@
+defaults:
+  - base_evaluation
+  - _self_
+
+run_after_fit: true
+checkpoint_path: null
+batch_size: null
+conf: 0.001
+iou: 0.7
+max_det: 300
+save_json: true
+plots: false
+split: val
+benchmark_every_n_epochs: 1

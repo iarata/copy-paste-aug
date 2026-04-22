@@ -1,0 +1,41 @@
+defaults:
+  - base_dataset
+  - _self_
+
+name: coco2017
+root: data.nosync/raw/coco2017
+train_images: train2017
+val_images: val2017
+train_json: annotations/instances_train2017.json
+val_json: annotations/instances_val2017.json
+task: segment
+imgsz: 640
+batch_size: 12
+num_workers: 9
+pin_memory: false
+persistent_workers: true
+cache: false
+coco_eval: true
+
+augmentations:
+  name: cpa
+  prob: 0.5
+  mode: mixup
+  blend: true
+  sigma: 3.0
+  pct_objects_paste: 0.5
+  max_paste_objects: 10
+  mosaic: 1.0
+  mixup: 0.0
+  cutmix: 0.0
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
+  degrees: 0.0
+  translate: 0.1
+  scale: 0.5
+  shear: 0.0
+  perspective: 0.0
+  fliplr: 0.5
+  flipud: 0.0
+  bgr: 0.0

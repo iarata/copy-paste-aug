@@ -1,0 +1,9 @@
+defaults:
+  - base_models
+  - _self_
+
+# Train from scratch using the local upstream YOLO26 segmentation config.
+# `models.scale` selects the compound scale from the shared family YAML.
+name: configs/models/yolo26/yolo26-seg.yaml
+scale: n
+weights: null
