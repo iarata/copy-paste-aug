@@ -15,6 +15,10 @@ momentum: 0.937
 weight_decay: 0.0005
 lrf: 0.01
 cos_lr: true
+warmup_epochs: 3.0
+warmup_momentum: 0.8
+warmup_bias_lr: 0.1
+nbs: 64
 log_every_n_steps: 20
 limit_train_batches: 1.0
 limit_val_batches: 1.0

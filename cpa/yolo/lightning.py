@@ -114,6 +114,36 @@ def summarize_validator_metrics(
     return summary
 
 
+def lr_schedule_factor(cfg: Any, epoch: int) -> float:
+    if cfg.training.cos_lr:
+        return float(one_cycle(1, float(cfg.training.lrf), int(cfg.training.epochs))(epoch))
+    return max(1 - epoch / int(cfg.training.epochs), 0) * (1.0 - float(cfg.training.lrf)) + float(
+        cfg.training.lrf
+    )
+
+
+def apply_optimizer_warmup(
+    param_groups: list[dict[str, Any]],
+    *,
+    step_index: int,
+    warmup_steps: int,
+    end_lr_factor: float,
+    momentum: float,
+    warmup_momentum: float,
+    warmup_bias_lr: float,
+) -> None:
+    if warmup_steps <= 0 or step_index > warmup_steps:
+        return
+
+    xi = (0, warmup_steps)
+    for group in param_groups:
+        initial_lr = float(group.get("initial_lr", group["lr"]))
+        start_lr = warmup_bias_lr if group.get("param_group") == "bias" else 0.0
+        group["lr"] = float(np.interp(step_index, xi, [start_lr, initial_lr * end_lr_factor]))
+        if "momentum" in group:
+            group["momentum"] = float(np.interp(step_index, xi, [warmup_momentum, momentum]))
+
+
 def run_validator_without_fusing_model(validator: Any, model: nn.Module) -> dict[str, Any]:
     """Run an Ultralytics validator against a live training model without mutating it.
 
@@ -215,6 +245,7 @@ class YOLO26LightningModule(L.LightningModule):
         self.loss_names = LOSS_NAMES[self.task]
         self.max_wandb_samples = 4
         self._last_wandb_sample_epoch = -1
+        self._warmup_steps = -1
         self.resolved_model_source = resolve_model_source(
             cfg.models.name,
             getattr(cfg.models, "scale", None),
@@ -249,12 +280,35 @@ class YOLO26LightningModule(L.LightningModule):
             self.model.set_head_attr(max_det=300)
 
     def on_fit_start(self) -> None:
+        if self.trainer is not None:
+            warmup_epochs = float(getattr(self.cfg.training, "warmup_epochs", 3.0))
+            if warmup_epochs > 0:
+                self._warmup_steps = max(round(warmup_epochs * int(self.trainer.num_training_batches)), 100)
         if not isinstance(self.logger, WandbLogger):
             return
         experiment = self.logger.experiment
         experiment.define_metric("epoch")
         for pattern in ("train/*", "val/*", "benchmark/*", "samples/*", "lr-*"):
             experiment.define_metric(pattern, step_metric="epoch")
+
+    def on_train_batch_start(self, batch: dict[str, Any], batch_idx: int) -> None:
+        if self.trainer is None or self._warmup_steps <= 0:
+            return
+
+        step_index = int(batch_idx + int(self.trainer.num_training_batches) * int(self.current_epoch))
+        apply_optimizer_warmup(
+            self.trainer.optimizers[0].param_groups,
+            step_index=step_index,
+            warmup_steps=self._warmup_steps,
+            end_lr_factor=lr_schedule_factor(self.cfg, int(self.current_epoch)),
+            momentum=float(self.cfg.training.momentum),
+            warmup_momentum=float(getattr(self.cfg.training, "warmup_momentum", 0.8)),
+            warmup_bias_lr=(
+                0.0
+                if str(self.cfg.training.optimizer).lower() == "auto"
+                else float(getattr(self.cfg.training, "warmup_bias_lr", 0.1))
+            ),
+        )
 
     def _preprocess_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
         batch["img"] = batch["img"].float() / 255.0
@@ -478,23 +532,28 @@ class YOLO26LightningModule(L.LightningModule):
         iterations = max(
             int(getattr(self.trainer, "estimated_stepping_batches", self.cfg.training.epochs)), 1
         )
+        world_size = max(int(getattr(self.trainer, "world_size", 1)), 1)
+        nominal_batch_size = max(float(getattr(self.cfg.training, "nbs", 64)), 1.0)
+        effective_batch_size = (
+            int(self.cfg.dataset.batch_size)
+            * world_size
+            * int(getattr(self.cfg.training, "accumulate_grad_batches", 1))
+        )
+        scaled_decay = float(self.cfg.training.weight_decay) * effective_batch_size / nominal_batch_size
         optimizer = build_ultralytics_optimizer(
             self.model,
             name=self.cfg.training.optimizer,
             lr=float(self.cfg.training.lr0),
             momentum=float(self.cfg.training.momentum),
-            decay=float(self.cfg.training.weight_decay),
+            decay=scaled_decay,
             iterations=iterations,
             nc=len(self.names),
         )
-        if self.cfg.training.cos_lr:
-            lr_lambda = one_cycle(1, float(self.cfg.training.lrf), int(self.cfg.training.epochs))
-        else:
+        for group in optimizer.param_groups:
+            group.setdefault("initial_lr", group["lr"])
 
-            def lr_lambda(epoch: int) -> float:
-                return max(1 - epoch / int(self.cfg.training.epochs), 0) * (
-                    1.0 - float(self.cfg.training.lrf)
-                ) + float(self.cfg.training.lrf)
+        def lr_lambda(epoch: int) -> float:
+            return lr_schedule_factor(self.cfg, epoch)
 
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
         return {

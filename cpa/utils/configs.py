@@ -93,6 +93,10 @@ class TrainingConfig:
     weight_decay: float = 0.0005
     lrf: float = 0.01
     cos_lr: bool = True
+    warmup_epochs: float = 3.0
+    warmup_momentum: float = 0.8
+    warmup_bias_lr: float = 0.1
+    nbs: int = 64
     log_every_n_steps: int = 20
     limit_train_batches: float = 1.0
     limit_val_batches: float = 1.0

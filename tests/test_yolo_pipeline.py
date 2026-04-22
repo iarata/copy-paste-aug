@@ -22,7 +22,9 @@ from cpa.yolo.data import COCOJsonDataModule
 from cpa.yolo.lightning import (
     COCOJsonSegmentationValidator,
     YOLO26LightningModule,
+    apply_optimizer_warmup,
     build_validator_args,
+    lr_schedule_factor,
     resolve_model_source,
     run_validator_without_fusing_model,
     summarize_validator_metrics,
@@ -236,6 +238,38 @@ def test_resolve_precision_prefers_bfloat16_when_supported(monkeypatch: pytest.M
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
 
     assert resolve_precision("auto") == "bf16-mixed"
+
+
+def test_apply_optimizer_warmup_interpolates_lr_and_momentum():
+    param_groups = [
+        {"lr": 0.01, "initial_lr": 0.01, "param_group": "weight", "momentum": 0.937},
+        {"lr": 0.01, "initial_lr": 0.01, "param_group": "bias", "momentum": 0.937},
+    ]
+
+    apply_optimizer_warmup(
+        param_groups,
+        step_index=50,
+        warmup_steps=100,
+        end_lr_factor=1.0,
+        momentum=0.937,
+        warmup_momentum=0.8,
+        warmup_bias_lr=0.1,
+    )
+
+    assert param_groups[0]["lr"] == pytest.approx(0.005)
+    assert param_groups[1]["lr"] == pytest.approx(0.055)
+    assert param_groups[0]["momentum"] == pytest.approx(0.8685)
+    assert param_groups[1]["momentum"] == pytest.approx(0.8685)
+
+
+def test_lr_schedule_factor_matches_linear_tail(coco_root: Path):
+    cfg = _config(coco_root, aug_name="none")
+    cfg.training.cos_lr = False
+    cfg.training.epochs = 100
+    cfg.training.lrf = 0.01
+
+    assert lr_schedule_factor(cfg, 0) == pytest.approx(1.0)
+    assert lr_schedule_factor(cfg, 100) == pytest.approx(0.01)
 
 
 def test_wandb_helpers_tolerate_dummy_experiment() -> None:
