@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 from typing import Any
+from unittest.mock import patch
 
 import cv2
 import lightning as L
@@ -18,6 +19,7 @@ from ultralytics.cfg import get_cfg
 from ultralytics.data import converter
 from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.models.yolo.segment import SegmentationValidator
+from ultralytics.nn.autobackend import AutoBackend
 from ultralytics.optim import MuSGD
 from ultralytics.utils import colorstr
 from ultralytics.utils.torch_utils import one_cycle, unwrap_model
@@ -110,6 +112,24 @@ def summarize_validator_metrics(
     summary["benchmark/inference_ms_per_image"] = inference_ms
     summary["benchmark/mAP50-95_per_ms"] = primary_value / inference_ms if inference_ms > 0 else 0.0
     return summary
+
+
+def run_validator_without_fusing_model(validator: Any, model: nn.Module) -> dict[str, Any]:
+    """Run an Ultralytics validator against a live training model without mutating it.
+
+    Ultralytics validators wrap nn.Module inputs in AutoBackend with `fuse=True`
+    by default. For YOLO26 segmentation heads, fusing calls `Proto26.fuse()`,
+    which drops the semantic branch used during training. We patch the validator's
+    AutoBackend reference so benchmarking can reuse the live model safely.
+    """
+
+    class _NonFusingAutoBackend(AutoBackend):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            kwargs["fuse"] = False
+            super().__init__(*args, **kwargs)
+
+    with patch("ultralytics.engine.validator.AutoBackend", _NonFusingAutoBackend):
+        return validator(model=model)
 
 
 def build_ultralytics_optimizer(
@@ -365,7 +385,7 @@ class YOLO26LightningModule(L.LightningModule):
             save_dir=output_dir,
             args=build_validator_args(data_yaml, self.cfg, int(datamodule.eval_batch_size)),
         )
-        metrics = validator(model=self.model)
+        metrics = run_validator_without_fusing_model(validator, self.model)
         benchmark_metrics = summarize_validator_metrics(task=self.task, metrics=metrics, speed=validator.speed)
         (output_dir / "metrics.json").write_text(
             json.dumps({**metrics, **benchmark_metrics}, indent=2, sort_keys=True),
@@ -376,7 +396,7 @@ class YOLO26LightningModule(L.LightningModule):
     def _log_loss_items(
         self,
         prefix: str,
-        loss: torch.Tensor,
+        loss_total: torch.Tensor,
         loss_items: torch.Tensor,
         batch_size: int,
         *,
@@ -385,7 +405,7 @@ class YOLO26LightningModule(L.LightningModule):
     ) -> None:
         self.log(
             f"{prefix}/loss",
-            loss,
+            loss_total,
             prog_bar=prefix == "val",
             on_step=on_step,
             on_epoch=on_epoch,
@@ -402,18 +422,38 @@ class YOLO26LightningModule(L.LightningModule):
                 sync_dist=True,
             )
 
+    def _compute_loss(
+        self,
+        batch: dict[str, Any],
+        *,
+        prefix: str,
+        batch_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        raw_loss, loss_items = self.model.loss(batch)
+        raw_loss = raw_loss.sum() if raw_loss.ndim > 0 else raw_loss
+        loss_items = loss_items.detach().float()
+        loss_total = loss_items.sum()
+
+        if not torch.isfinite(raw_loss).all() or not torch.isfinite(loss_items).all():
+            rendered = ", ".join(
+                f"{name}={value.item():.6g}" for name, value in zip(self.loss_names, loss_items, strict=False)
+            )
+            raise FloatingPointError(
+                f"Non-finite {prefix} loss at epoch={self.current_epoch} batch={batch_idx}: {rendered}"
+            )
+
+        return raw_loss, loss_total, loss_items
+
     def training_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:
         batch = self._preprocess_batch(batch)
-        loss, loss_items = self.model.loss(batch)
-        loss = loss.sum() if loss.ndim > 0 else loss
-        self._log_loss_items("train", loss, loss_items, batch["img"].shape[0], on_step=False, on_epoch=True)
+        loss, loss_total, loss_items = self._compute_loss(batch, prefix="train", batch_idx=batch_idx)
+        self._log_loss_items("train", loss_total, loss_items, batch["img"].shape[0], on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:
         batch = self._preprocess_batch(batch)
-        loss, loss_items = self.model.loss(batch)
-        loss = loss.sum() if loss.ndim > 0 else loss
-        self._log_loss_items("val", loss, loss_items, batch["img"].shape[0], on_step=False, on_epoch=True)
+        loss, loss_total, loss_items = self._compute_loss(batch, prefix="val", batch_idx=batch_idx)
+        self._log_loss_items("val", loss_total, loss_items, batch["img"].shape[0], on_step=False, on_epoch=True)
         if batch_idx == 0:
             self._maybe_log_wandb_samples(batch, split="val")
         return loss

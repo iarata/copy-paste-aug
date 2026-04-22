@@ -8,7 +8,7 @@ from PIL import Image
 import pytest
 import torch
 
-from cpa.training import build_trainer, log_wandb_run_config, update_wandb_summary
+from cpa.training import build_trainer, log_wandb_run_config, resolve_precision, update_wandb_summary
 from cpa.utils.configs import (
     AugmentationsConfig,
     Config,
@@ -19,7 +19,14 @@ from cpa.utils.configs import (
     WandbConfig,
 )
 from cpa.yolo.data import COCOJsonDataModule
-from cpa.yolo.lightning import YOLO26LightningModule, resolve_model_source, summarize_validator_metrics
+from cpa.yolo.lightning import (
+    COCOJsonSegmentationValidator,
+    YOLO26LightningModule,
+    build_validator_args,
+    resolve_model_source,
+    run_validator_without_fusing_model,
+    summarize_validator_metrics,
+)
 
 
 def _categories() -> list[dict[str, object]]:
@@ -147,6 +154,12 @@ def test_lightning_module_computes_yolo26_loss(coco_root: Path):
     assert torch.isfinite(loss_items).all()
     assert loss_items.numel() == 5
 
+    backward_loss, logged_total, logged_items = module._compute_loss(batch, prefix="train", batch_idx=0)
+    assert torch.isfinite(backward_loss)
+    assert torch.isfinite(logged_total)
+    assert torch.isfinite(logged_items).all()
+    assert logged_total.item() == pytest.approx(float(logged_items.sum()))
+
 
 def test_local_family_yaml_respects_models_scale(coco_root: Path):
     cfg = _config(coco_root, aug_name="none", model_scale="s")
@@ -218,6 +231,13 @@ def test_debug_builds_fast_dev_run_trainer(coco_root: Path, tmp_path: Path):
     assert trainer.fast_dev_run == 1
 
 
+def test_resolve_precision_prefers_bfloat16_when_supported(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+
+    assert resolve_precision("auto") == "bf16-mixed"
+
+
 def test_wandb_helpers_tolerate_dummy_experiment() -> None:
     class DummyExperiment:
         @property
@@ -239,3 +259,25 @@ def test_wandb_helpers_tolerate_dummy_experiment() -> None:
     update_wandb_summary(logger, {"benchmark/mAP50-95": 0.5})
 
     assert logger.logged == payload
+
+
+def test_validation_benchmark_does_not_fuse_training_model(coco_root: Path, tmp_path: Path):
+    cfg = _config(coco_root, aug_name="none")
+    cfg.evaluation.save_json = False
+    datamodule = COCOJsonDataModule(cfg.dataset, project_root=Path.cwd())
+    datamodule.setup("validate")
+    module = YOLO26LightningModule(cfg, datamodule.names, project_root=Path.cwd())
+
+    head = module.model.model[-1]
+    assert head.proto.semseg is not None
+
+    data_yaml = datamodule.write_data_yaml(tmp_path / "coco_data.yaml")
+    validator = COCOJsonSegmentationValidator(
+        dataloader=datamodule.val_dataloader(),
+        save_dir=tmp_path / "validation",
+        args=build_validator_args(data_yaml, cfg, int(datamodule.eval_batch_size)),
+    )
+    metrics = run_validator_without_fusing_model(validator, module.model)
+
+    assert "metrics/mAP50-95(M)" in metrics
+    assert head.proto.semseg is not None

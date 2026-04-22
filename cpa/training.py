@@ -22,7 +22,9 @@ register_configs()
 def resolve_precision(precision: str) -> str:
     if precision != "auto":
         return precision
-    return "16-mixed" if torch.cuda.is_available() else "32-true"
+    if torch.cuda.is_available():
+        return "bf16-mixed" if torch.cuda.is_bf16_supported() else "16-mixed"
+    return "32-true"
 
 
 def configure_torch_runtime() -> None:
