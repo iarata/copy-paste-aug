@@ -8,7 +8,7 @@ from PIL import Image
 import pytest
 import torch
 
-from cpa.training import build_trainer
+from cpa.training import build_trainer, log_wandb_run_config, update_wandb_summary
 from cpa.utils.configs import (
     AugmentationsConfig,
     Config,
@@ -216,3 +216,26 @@ def test_debug_builds_fast_dev_run_trainer(coco_root: Path, tmp_path: Path):
     trainer = build_trainer(cfg, wandb_logger=None, default_root_dir=tmp_path)
 
     assert trainer.fast_dev_run == 1
+
+
+def test_wandb_helpers_tolerate_dummy_experiment() -> None:
+    class DummyExperiment:
+        @property
+        def summary(self):
+            return lambda *args, **kwargs: None
+
+    class DummyLogger:
+        def __init__(self):
+            self.logged = None
+            self.experiment = DummyExperiment()
+
+        def log_hyperparams(self, params):
+            self.logged = params
+
+    logger = DummyLogger()
+
+    payload = {"model_name": "yolo26-seg.yaml", "debug": False}
+    log_wandb_run_config(logger, payload)
+    update_wandb_summary(logger, {"benchmark/mAP50-95": 0.5})
+
+    assert logger.logged == payload

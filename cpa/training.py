@@ -25,6 +25,11 @@ def resolve_precision(precision: str) -> str:
     return "16-mixed" if torch.cuda.is_available() else "32-true"
 
 
+def configure_torch_runtime() -> None:
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+
+
 def maybe_make_wandb_logger(cfg: Config) -> WandbLogger | None:
     if cfg.wandb.mode:
         os.environ["WANDB_MODE"] = str(cfg.wandb.mode)
@@ -43,6 +48,21 @@ def maybe_make_wandb_logger(cfg: Config) -> WandbLogger | None:
         log_model=bool(cfg.wandb.log_model),
         tags=tags,
     )
+
+
+def log_wandb_run_config(wandb_logger: WandbLogger | None, payload: dict[str, object]) -> None:
+    if wandb_logger is None:
+        return
+    wandb_logger.log_hyperparams(payload)
+
+
+def update_wandb_summary(wandb_logger: WandbLogger | None, payload: dict[str, object]) -> None:
+    if wandb_logger is None:
+        return
+
+    summary = getattr(wandb_logger.experiment, "summary", None)
+    if hasattr(summary, "update"):
+        summary.update(payload)
 
 
 def build_trainer(cfg: Config, wandb_logger: WandbLogger | None, default_root_dir: Path) -> L.Trainer:
@@ -80,18 +100,17 @@ def run_fit(cfg: Config, project_root: Path) -> None:
     datamodule = COCOJsonDataModule(cfg.dataset, project_root=project_root, eval_batch_size=eval_batch_size)
     module = YOLO26LightningModule(cfg, datamodule.names, project_root=project_root)
     wandb_logger = maybe_make_wandb_logger(cfg)
-    if wandb_logger is not None and wandb_logger.experiment is not None:
-        wandb_logger.experiment.config.update(
-            {
-                "model_name": cfg.models.name,
-                "model_scale": getattr(cfg.models, "scale", None),
-                "model_weights": getattr(cfg.models, "weights", None),
-                "resolved_model_source": module.resolved_model_source,
-                "task": cfg.dataset.task,
-                "debug": bool(cfg.debug),
-            },
-            allow_val_change=True,
-        )
+    log_wandb_run_config(
+        wandb_logger,
+        {
+            "model_name": cfg.models.name,
+            "model_scale": getattr(cfg.models, "scale", None),
+            "model_weights": getattr(cfg.models, "weights", None),
+            "resolved_model_source": module.resolved_model_source,
+            "task": cfg.dataset.task,
+            "debug": bool(cfg.debug),
+        },
+    )
     trainer = build_trainer(cfg, wandb_logger, Path.cwd())
 
     resume = cfg.training.resume_from_checkpoint
@@ -122,8 +141,7 @@ def run_fit(cfg: Config, project_root: Path) -> None:
             output_dir=Path.cwd() / "evaluation",
         )
         logger.info("Evaluation metrics: {}", metrics)
-        if wandb_logger is not None and wandb_logger.experiment is not None:
-            wandb_logger.experiment.summary.update(metrics)
+        update_wandb_summary(wandb_logger, metrics)
 
 
 def run_eval(cfg: Config, project_root: Path) -> None:
@@ -148,6 +166,7 @@ def run_eval(cfg: Config, project_root: Path) -> None:
 def main(cfg: DictConfig) -> None:
     typed_cfg: Config = cast(Config, OmegaConf.to_object(cfg))
     project_root = Path(hydra.utils.get_original_cwd())
+    configure_torch_runtime()
     L.seed_everything(typed_cfg.seed, workers=True)
 
     logger.info("Running YOLO26 pipeline in {} mode", typed_cfg.training.mode)
