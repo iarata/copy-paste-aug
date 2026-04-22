@@ -81,10 +81,37 @@ def primary_map50_95_key(task: str, metrics: dict[str, Any]) -> str:
     return "metrics/mAP50-95"
 
 
+def primary_map50_key(task: str, metrics: dict[str, Any]) -> str:
+    if task == "segment" and "metrics/mAP50(M)" in metrics:
+        return "metrics/mAP50(M)"
+    if "metrics/mAP50(B)" in metrics:
+        return "metrics/mAP50(B)"
+    return "metrics/mAP50"
+
+
+def mean_f1(metric: Any) -> float:
+    values = np.asarray(getattr(metric, "f1", []), dtype=np.float32)
+    return float(values.mean()) if values.size else 0.0
+
+
+def summarize_metric_family(metric: Any, *, suffix: str) -> dict[str, float]:
+    if metric is None:
+        return {}
+
+    return {
+        f"val/precision_{suffix}": float(getattr(metric, "mp", 0.0)),
+        f"val/recall_{suffix}": float(getattr(metric, "mr", 0.0)),
+        f"val/f1_{suffix}": mean_f1(metric),
+        f"val/mAP50_{suffix}": float(getattr(metric, "map50", 0.0)),
+        f"val/mAP50-95_{suffix}": float(getattr(metric, "map", 0.0)),
+    }
+
+
 def summarize_validator_metrics(
     *,
     task: str,
     metrics: dict[str, Any],
+    validator_metrics: Any | None = None,
     speed: dict[str, float] | None = None,
 ) -> dict[str, float]:
     summary: dict[str, float] = {}
@@ -101,15 +128,36 @@ def summarize_validator_metrics(
         )
         summary[f"benchmark/{metric_name}"] = float(value)
 
+    box_metrics = getattr(validator_metrics, "box", validator_metrics)
+    mask_metrics = getattr(validator_metrics, "seg", None) if task == "segment" else None
+    summary.update(summarize_metric_family(box_metrics, suffix="box"))
+    summary.update(summarize_metric_family(mask_metrics, suffix="mask"))
+
+    primary_metrics = mask_metrics if mask_metrics is not None else box_metrics
+    if primary_metrics is not None:
+        summary["val/precision"] = float(getattr(primary_metrics, "mp", 0.0))
+        summary["val/recall"] = float(getattr(primary_metrics, "mr", 0.0))
+        summary["val/f1"] = mean_f1(primary_metrics)
+        summary["val/mAP50"] = float(getattr(primary_metrics, "map50", 0.0))
+        summary["val/mAP50-95"] = float(getattr(primary_metrics, "map", 0.0))
+
+    fitness = float(metrics.get("fitness", getattr(validator_metrics, "fitness", 0.0)))
+    summary["val/fitness"] = fitness
+
     speed = speed or {}
     for name, value in speed.items():
+        summary[f"val/{name}_ms_per_image"] = float(value)
         summary[f"benchmark/{name}_ms_per_image"] = float(value)
 
+    primary_map50 = float(metrics.get(primary_map50_key(task, metrics), 0.0))
     primary_key = primary_map50_95_key(task, metrics)
     primary_value = float(metrics.get(primary_key, 0.0))
     inference_ms = float(speed.get("inference", 0.0))
+    summary["benchmark/mAP50"] = primary_map50
     summary["benchmark/mAP50-95"] = primary_value
+    summary["benchmark/fitness"] = fitness
     summary["benchmark/inference_ms_per_image"] = inference_ms
+    summary["benchmark/mAP50_per_ms"] = primary_map50 / inference_ms if inference_ms > 0 else 0.0
     summary["benchmark/mAP50-95_per_ms"] = primary_value / inference_ms if inference_ms > 0 else 0.0
     return summary
 
@@ -421,8 +469,7 @@ class YOLO26LightningModule(L.LightningModule):
             return False
         if not self.trainer.is_global_zero:
             return False
-        interval = int(getattr(self.cfg.evaluation, "benchmark_every_n_epochs", 1))
-        return interval > 0 and (int(self.current_epoch) + 1) % interval == 0
+        return bool(getattr(self.cfg.evaluation, "run_epoch_metrics", True))
 
     def _run_validation_benchmark(self) -> dict[str, float]:
         if self.trainer is None or self.trainer.datamodule is None:
@@ -440,7 +487,12 @@ class YOLO26LightningModule(L.LightningModule):
             args=build_validator_args(data_yaml, self.cfg, int(datamodule.eval_batch_size)),
         )
         metrics = run_validator_without_fusing_model(validator, self.model)
-        benchmark_metrics = summarize_validator_metrics(task=self.task, metrics=metrics, speed=validator.speed)
+        benchmark_metrics = summarize_validator_metrics(
+            task=self.task,
+            metrics=metrics,
+            validator_metrics=validator.metrics,
+            speed=validator.speed,
+        )
         (output_dir / "metrics.json").write_text(
             json.dumps({**metrics, **benchmark_metrics}, indent=2, sort_keys=True),
             encoding="utf-8",
@@ -634,7 +686,12 @@ def evaluate_checkpoint(
     metrics = validator(model=module.model)
     metrics = {
         **metrics,
-        **summarize_validator_metrics(task=cfg.dataset.task, metrics=metrics, speed=validator.speed),
+        **summarize_validator_metrics(
+            task=cfg.dataset.task,
+            metrics=metrics,
+            validator_metrics=validator.metrics,
+            speed=validator.speed,
+        ),
     }
 
     metrics_path = Path(output_dir) / "metrics.json"

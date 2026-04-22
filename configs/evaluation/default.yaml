@@ -3,6 +3,7 @@ defaults:
   - _self_
 
 run_after_fit: true
+run_epoch_metrics: true
 checkpoint_path: null
 batch_size: null
 conf: 0.001
@@ -11,4 +12,3 @@ max_det: 300
 save_json: true
 plots: false
 split: val
-benchmark_every_n_epochs: 1

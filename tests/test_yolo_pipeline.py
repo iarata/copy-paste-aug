@@ -207,21 +207,57 @@ def test_custom_copy_paste_pipeline_runs(coco_root: Path):
 
 
 def test_summarize_validator_metrics_adds_benchmark_fields():
+    class DummyMetric:
+        def __init__(self, *, mp: float, mr: float, map50: float, map_: float, f1: list[float]) -> None:
+            self.mp = mp
+            self.mr = mr
+            self.map50 = map50
+            self.map = map_
+            self.f1 = np.asarray(f1, dtype=np.float32)
+
+    class DummySegmentMetrics:
+        def __init__(self) -> None:
+            self.box = DummyMetric(mp=0.2, mr=0.3, map50=0.4, map_=0.1, f1=[0.24, 0.3])
+            self.seg = DummyMetric(mp=0.7, mr=0.8, map50=0.9, map_=0.42, f1=[0.74, 0.8])
+            self.fitness = 0.4
+
     summary = summarize_validator_metrics(
         task="segment",
         metrics={
+            "metrics/precision(B)": 0.2,
+            "metrics/recall(B)": 0.3,
+            "metrics/mAP50(B)": 0.4,
+            "metrics/mAP50-95(B)": 0.1,
+            "metrics/precision(M)": 0.7,
+            "metrics/recall(M)": 0.8,
             "metrics/mAP50-95(M)": 0.42,
-            "metrics/mAP50(M)": 0.7,
+            "metrics/mAP50(M)": 0.9,
             "fitness": 0.4,
         },
+        validator_metrics=DummySegmentMetrics(),
         speed={"preprocess": 1.5, "inference": 5.0, "postprocess": 0.5},
     )
 
+    assert summary["val/precision_box"] == pytest.approx(0.2)
+    assert summary["val/recall_mask"] == pytest.approx(0.8)
+    assert summary["val/f1_mask"] == pytest.approx(0.77)
+    assert summary["val/mAP50"] == pytest.approx(0.9)
+    assert summary["val/mAP50-95"] == pytest.approx(0.42)
+    assert summary["val/fitness"] == pytest.approx(0.4)
+    assert summary["val/preprocess_ms_per_image"] == pytest.approx(1.5)
     assert summary["benchmark/mAP50-95"] == pytest.approx(0.42)
+    assert summary["benchmark/mAP50"] == pytest.approx(0.9)
     assert summary["benchmark/inference_ms_per_image"] == pytest.approx(5.0)
+    assert summary["benchmark/mAP50_per_ms"] == pytest.approx(0.18)
     assert summary["benchmark/mAP50-95_per_ms"] == pytest.approx(0.084)
     assert summary["benchmark/preprocess_ms_per_image"] == pytest.approx(1.5)
     assert summary["benchmark/mAP50_95_mask"] == pytest.approx(0.42)
+
+
+def test_run_epoch_metrics_flag_defaults_to_enabled() -> None:
+    evaluation = EvaluationConfig()
+
+    assert evaluation.run_epoch_metrics is True
 
 
 def test_debug_builds_fast_dev_run_trainer(coco_root: Path, tmp_path: Path):

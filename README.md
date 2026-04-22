@@ -65,8 +65,8 @@ make eval ARGS="evaluation.checkpoint_path=/abs/path/to/checkpoints/last.ckpt"
 ```
 
 Evaluation writes metrics to `evaluation/metrics.json` inside the Hydra run directory and uses the Ultralytics validators for COCO-style metrics.
-During training, validation benchmarks are also written every `evaluation.benchmark_every_n_epochs` epochs under `validation_benchmark/epoch_XXX/metrics.json` and logged to W&B with `benchmark/mAP50-95` and `benchmark/inference_ms_per_image`.
-Training and validation loss logging is epoch-based so W&B charts track experiments by epoch instead of only by optimizer step.
+During training, epoch-end validator metrics can be toggled with `evaluation.run_epoch_metrics=true|false`. When enabled, they run at the end of every epoch, are written under `validation_benchmark/epoch_XXX/metrics.json`, and are logged to W&B with `val/*` and `benchmark/*` series such as `val/mAP50`, `val/mAP50-95`, `val/precision`, `val/recall`, `val/f1`, `benchmark/mAP50-95`, and `benchmark/inference_ms_per_image`.
+Training and validation losses are logged epoch-wise so W&B charts line up with the validator metrics on the same epoch axis.
 
 ## Project Organization
 

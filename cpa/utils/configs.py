@@ -60,6 +60,7 @@ class DatasetConfig:
 @dataclass
 class EvaluationConfig:
     run_after_fit: bool = True
+    run_epoch_metrics: bool = True
     checkpoint_path: Any = None
     batch_size: Any = None
     conf: float = 0.001
@@ -68,7 +69,6 @@ class EvaluationConfig:
     save_json: bool = True
     plots: bool = False
     split: str = "val"
-    benchmark_every_n_epochs: int = 1
 
 
 @dataclass
