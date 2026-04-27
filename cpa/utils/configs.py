@@ -16,7 +16,7 @@ from omegaconf import MISSING
 @dataclass
 class AugmentationsConfig:
     name: str = "cpa"
-    prob: float = 0.5
+    prob: float = 1.0
     mode: str = "mixup"
     blend: bool = True
     sigma: float = 3.0
@@ -74,18 +74,9 @@ class EvaluationConfig:
 @dataclass
 class ModelsConfig:
     name: str = "configs/models/yolo26/yolo26-seg.yaml"
-    scale: Any = "n"
-    weights: Any = None
     architecture: str = "yolo26"
-    embed_dim: int = 128
-    num_heads: int = 4
-    encoder_layers: int = 2
-    decoder_layers: int = 2
-    num_queries: int = 20
-    patch_size: int = 16
-    dropout: float = 0.1
-    log_samples: int = 4
-    visualization_threshold: float = 0.5
+    scale: str = "n"
+    weights: Any = None
 
 
 @dataclass
@@ -111,6 +102,22 @@ class TrainingConfig:
     limit_train_batches: float = 1.0
     limit_val_batches: float = 1.0
     resume_from_checkpoint: Any = None
+
+
+@dataclass
+class InstanceTransformerAugConfig:
+    experiment_name: str = "instance-transformer-copy-paste"
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
+
+
+@dataclass
+class InstanceTransformerNoAugConfig:
+    experiment_name: str = "instance-transformer-no-augmentation"
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
 
 @dataclass

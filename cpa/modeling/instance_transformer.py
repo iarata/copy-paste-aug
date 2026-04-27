@@ -348,7 +348,7 @@ class SimpleInstanceSegmentationTransformerModule(L.LightningModule):
             on_step=False,
             on_epoch=True,
             logger=True,
-            rank_zero_only=True,
+            sync_dist=True,
         )
 
     def configure_optimizers(self) -> dict[str, Any]:
@@ -372,7 +372,9 @@ class SimpleInstanceSegmentationTransformerModule(L.LightningModule):
         mean = torch.tensor(IMAGENET_MEAN, device=image.device).view(3, 1, 1)
         std = torch.tensor(IMAGENET_STD, device=image.device).view(3, 1, 1)
         image = (image * std + mean).clamp(0, 1)
-        return (image.detach().cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        return np.ascontiguousarray(
+            (image.detach().float().cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        )
 
     def _overlay_masks(
         self,
@@ -396,8 +398,8 @@ class SimpleInstanceSegmentationTransformerModule(L.LightningModule):
         image = self._denormalize_image(batch["images"][sample_idx].to(self.device))
         height, width = image.shape[:2]
         target_masks = batch["masks"][sample_idx].detach().cpu().numpy()
-        pred_scores = outputs["object_logits"][sample_idx].sigmoid().detach().cpu().numpy()
-        pred_masks = outputs["mask_logits"][sample_idx].sigmoid().detach().cpu().numpy()
+        pred_scores = outputs["object_logits"][sample_idx].sigmoid().detach().float().cpu().numpy()
+        pred_masks = outputs["mask_logits"][sample_idx].sigmoid().detach().float().cpu().numpy()
         keep = pred_scores >= float(getattr(self.cfg.models, "visualization_threshold", 0.5))
         pred_masks = pred_masks[keep] >= 0.5
         if pred_masks.size:
