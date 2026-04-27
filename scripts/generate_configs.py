@@ -102,6 +102,15 @@ def infer_type(value: Any) -> str:
     return "Any"
 
 
+def infer_type_from_values(values: list[Any]) -> str:
+    """Infer a conservative annotation that accepts all variant values for a field."""
+    if any(value is None for value in values):
+        return "Any"
+
+    inferred = {infer_type(value) for value in values}
+    return inferred.pop() if len(inferred) == 1 else "Any"
+
+
 def format_default(value: Any) -> str:
     """Render a scalar YAML value as a Python literal string."""
     if value is None:
@@ -142,18 +151,40 @@ def collect_dataclasses(
     str
         The class name that was generated for *name*.
     """
+    return collect_dataclasses_from_variants(name, [data], ordered)
+
+
+def collect_dataclasses_from_variants(
+    name: str,
+    variants: list[dict],
+    ordered: dict[str, str],
+) -> str:
+    """Recursively emit dataclasses from all YAML variants in a config group.
+
+    Hydra validates every variant in a group against the same base schema. A
+    field that is nullable or present only in a non-default variant must
+    therefore still be represented in the generated dataclass.
+    """
     class_name = to_class_name(name)
     field_lines: list[str] = []
+    keys: list[str] = []
 
-    for key, value in data.items():
-        if key in HYDRA_RESERVED:
-            continue
+    for data in variants:
+        for key in data:
+            if key not in HYDRA_RESERVED and key not in keys:
+                keys.append(key)
 
-        if isinstance(value, dict):
-            nested_cls = collect_dataclasses(key, value, ordered)
+    for key in keys:
+        values = [data[key] for data in variants if key in data]
+        default_value = values[0]
+
+        if all(isinstance(value, dict) for value in values):
+            nested_cls = collect_dataclasses_from_variants(key, values, ordered)
             field_lines.append(f"    {key}: {nested_cls} = field(default_factory={nested_cls})")
         else:
-            field_lines.append(f"    {key}: {infer_type(value)} = {format_default(value)}")
+            field_lines.append(
+                f"    {key}: {infer_type_from_values(values)} = {format_default(default_value)}"
+            )
 
     body = "\n".join(field_lines) if field_lines else "    pass"
     class_src = f"@dataclass\nclass {class_name}:\n{body}"
@@ -170,8 +201,8 @@ def collect_dataclasses(
 # ---------------------------------------------------------------------------
 
 
-def discover_groups(configs_dir: Path, skip_file: str) -> dict[str, Path]:
-    """Return an ordered mapping of ``group_name -> yaml_path``.
+def discover_groups(configs_dir: Path, skip_file: str) -> dict[str, list[Path]]:
+    """Return an ordered mapping of ``group_name -> yaml variant paths``.
 
     Search strategy (subdirectory structure has priority):
 
@@ -179,26 +210,25 @@ def discover_groups(configs_dir: Path, skip_file: str) -> dict[str, Path]:
     2. ``configs/{group}/*.yml``         – any other variant in a subdir
     3. ``configs/{group}.yml``           – legacy flat file (fallback)
     """
-    groups: dict[str, Path] = {}
+    groups: dict[str, list[Path]] = {}
 
     # ── subdirectories (higher priority) ────────────────────────────────────
     for subdir in sorted(configs_dir.iterdir()):
         if not subdir.is_dir() or subdir.name.startswith("."):
             continue
         default_variant = subdir / "default.yaml"
+        variants = sorted(subdir.glob("*.yaml"))
         if default_variant.exists():
-            groups[subdir.name] = default_variant
-        else:
-            variants = sorted(subdir.glob("*.yaml"))
-            if variants:
-                groups[subdir.name] = variants[0]
+            variants = [default_variant, *[path for path in variants if path != default_variant]]
+        if variants:
+            groups[subdir.name] = variants
 
     # ── flat files (lower priority / fallback) ───────────────────────────────
     for yaml_path in sorted(configs_dir.glob("*.yaml")):
         if yaml_path.name in (skip_file, ".gitkeep"):
             continue
         group_name = yaml_path.stem
-        groups.setdefault(group_name, yaml_path)
+        groups.setdefault(group_name, [yaml_path])
 
     return groups
 
@@ -279,17 +309,21 @@ def generate_configs(configs_dir: Path, output_file: Path) -> None:
     # ── 1. Build sub-config dataclasses from group YAML files ────────────────
     groups = discover_groups(configs_dir, skip_file=PRIMARY_CONFIG)
 
-    for group_name, yaml_path in groups.items():
-        with yaml_path.open(encoding="utf-8") as fh:
-            data = yaml.safe_load(fh)
+    for group_name, yaml_paths in groups.items():
+        variants = []
+        for yaml_path in yaml_paths:
+            with yaml_path.open(encoding="utf-8") as fh:
+                data = yaml.safe_load(fh)
+            if isinstance(data, dict):
+                variants.append(data)
 
-        if not isinstance(data, dict):
+        if not variants:
             # Empty or non-mapping file → emit a stub
             cls = to_class_name(group_name)
             ordered.setdefault(cls, f"@dataclass\nclass {cls}:\n    pass")
             continue
 
-        collect_dataclasses(group_name, data, ordered)
+        collect_dataclasses_from_variants(group_name, variants, ordered)
 
     # ── 2. Build the root Config from default.yml ────────────────────────────
     primary_path = configs_dir / PRIMARY_CONFIG
