@@ -98,13 +98,30 @@ def summarize_metric_family(metric: Any, *, suffix: str) -> dict[str, float]:
     if metric is None:
         return {}
 
+    map95 = ap_at_iou(metric, index=-1)
     return {
         f"val/precision_{suffix}": float(getattr(metric, "mp", 0.0)),
         f"val/recall_{suffix}": float(getattr(metric, "mr", 0.0)),
         f"val/f1_{suffix}": mean_f1(metric),
         f"val/mAP50_{suffix}": float(getattr(metric, "map50", 0.0)),
         f"val/mAP50-95_{suffix}": float(getattr(metric, "map", 0.0)),
+        f"test/mAP95_{suffix}": map95,
     }
+
+
+def ap_at_iou(metric: Any, *, index: int) -> float:
+    all_ap = getattr(metric, "all_ap", None)
+    if all_ap is None:
+        return 0.0
+    values = np.asarray(all_ap, dtype=np.float32)
+    if values.size == 0:
+        return 0.0
+    if values.ndim == 1:
+        selected = values[index:]
+    else:
+        selected = values[:, index]
+    selected = selected[np.isfinite(selected)]
+    return float(selected.mean()) if selected.size else 0.0
 
 
 def summarize_validator_metrics(
@@ -135,11 +152,13 @@ def summarize_validator_metrics(
 
     primary_metrics = mask_metrics if mask_metrics is not None else box_metrics
     if primary_metrics is not None:
+        map95 = ap_at_iou(primary_metrics, index=-1)
         summary["val/precision"] = float(getattr(primary_metrics, "mp", 0.0))
         summary["val/recall"] = float(getattr(primary_metrics, "mr", 0.0))
         summary["val/f1"] = mean_f1(primary_metrics)
         summary["val/mAP50"] = float(getattr(primary_metrics, "map50", 0.0))
         summary["val/mAP50-95"] = float(getattr(primary_metrics, "map", 0.0))
+        summary["test/mAP95"] = map95
 
     fitness = float(metrics.get("fitness", getattr(validator_metrics, "fitness", 0.0)))
     summary["val/fitness"] = fitness
@@ -155,6 +174,7 @@ def summarize_validator_metrics(
     inference_ms = float(speed.get("inference", 0.0))
     summary["benchmark/mAP50"] = primary_map50
     summary["benchmark/mAP50-95"] = primary_value
+    summary["benchmark/mAP95"] = summary.get("test/mAP95", 0.0)
     summary["benchmark/fitness"] = fitness
     summary["benchmark/inference_ms_per_image"] = inference_ms
     summary["benchmark/mAP50_per_ms"] = primary_map50 / inference_ms if inference_ms > 0 else 0.0

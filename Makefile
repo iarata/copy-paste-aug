@@ -63,6 +63,11 @@ create-env:
 train:
 	uv run python -m cpa.training $(ARGS)
 
+# .PHONY train-detr
+# train-detr:
+	# uv run python -m cpa.training --config-name instance_transformer_aug
+	# uv run python -m cpa.training --config-name instance_transformer_no_aug
+
 ## Run evaluation
 .PHONY: eval
 eval:

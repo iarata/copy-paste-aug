@@ -161,6 +161,9 @@ def build_train_transforms(cfg: DatasetConfig) -> A.Compose:
     aug = cfg.augmentations
     sz = _cfg_imgsz(cfg)
 
+    if getattr(aug, "name", "cpa") in {"none", "disabled"}:
+        return build_val_transforms(cfg)
+
     return A.Compose(
         [
             # ── Pre-paste: independent spatial augmentations ──────────────────

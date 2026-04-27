@@ -19,7 +19,7 @@ coco_eval: true
 
 augmentations:
   name: cpa
-  prob: 0.5
+  prob: 1.0
   mode: mixup
   blend: true
   sigma: 3.0

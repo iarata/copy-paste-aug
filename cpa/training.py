@@ -12,6 +12,8 @@ from loguru import logger
 from omegaconf import DictConfig, OmegaConf
 import torch
 
+from cpa.datasets import Coco2017DataModule
+from cpa.modeling import SimpleInstanceSegmentationTransformerModule, evaluate_mask_map95
 from cpa.utils.configs import Config, register_configs
 from cpa.yolo.data import COCOJsonDataModule, resolve_path
 from cpa.yolo.lightning import YOLO26LightningModule, evaluate_checkpoint
@@ -98,6 +100,37 @@ def build_trainer(cfg: Config, wandb_logger: WandbLogger | None, default_root_di
 
 
 def run_fit(cfg: Config, project_root: Path) -> None:
+    if getattr(cfg.models, "architecture", "yolo26") == "simple_instance_transformer":
+        datamodule = Coco2017DataModule(cfg.dataset)
+        module = SimpleInstanceSegmentationTransformerModule(cfg)
+        wandb_logger = maybe_make_wandb_logger(cfg)
+        log_wandb_run_config(
+            wandb_logger,
+            {
+                "model_name": cfg.models.name,
+                "architecture": cfg.models.architecture,
+                "task": cfg.dataset.task,
+                "augmentation": cfg.dataset.augmentations.name,
+                "copy_paste_prob": cfg.dataset.augmentations.prob,
+                "debug": bool(cfg.debug),
+            },
+        )
+        trainer = build_trainer(cfg, wandb_logger, Path.cwd())
+        resume = cfg.training.resume_from_checkpoint
+        ckpt_path = str(resolve_path(resume, project_root)) if resume else None
+        trainer.fit(module, datamodule=datamodule, ckpt_path=ckpt_path)
+        if trainer.fast_dev_run:
+            logger.info("Skipping post-fit mAP95 test because fast_dev_run is enabled.")
+            return
+        if cfg.evaluation.run_after_fit:
+            datamodule.setup("validate")
+            metrics = evaluate_mask_map95(module, datamodule.val_dataloader())
+            logger.info("Post-fit simple transformer metrics: {}", metrics)
+            if wandb_logger is not None:
+                wandb_logger.log_metrics(metrics, step=int(trainer.global_step))
+                update_wandb_summary(wandb_logger, metrics)
+        return
+
     eval_batch_size = cfg.evaluation.batch_size or cfg.dataset.batch_size
     datamodule = COCOJsonDataModule(cfg.dataset, project_root=project_root, eval_batch_size=eval_batch_size)
     module = YOLO26LightningModule(cfg, datamodule.names, project_root=project_root)
@@ -171,7 +204,11 @@ def main(cfg: DictConfig) -> None:
     configure_torch_runtime()
     L.seed_everything(typed_cfg.seed, workers=True)
 
-    logger.info("Running YOLO26 pipeline in {} mode", typed_cfg.training.mode)
+    logger.info(
+        "Running {} pipeline in {} mode",
+        getattr(typed_cfg.models, "architecture", "yolo26"),
+        typed_cfg.training.mode,
+    )
     if typed_cfg.training.mode == "fit":
         run_fit(typed_cfg, project_root)
     elif typed_cfg.training.mode == "eval":

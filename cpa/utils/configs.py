@@ -74,8 +74,18 @@ class EvaluationConfig:
 @dataclass
 class ModelsConfig:
     name: str = "configs/models/yolo26/yolo26-seg.yaml"
-    scale: str = "n"
+    scale: Any = "n"
     weights: Any = None
+    architecture: str = "yolo26"
+    embed_dim: int = 128
+    num_heads: int = 4
+    encoder_layers: int = 2
+    decoder_layers: int = 2
+    num_queries: int = 20
+    patch_size: int = 16
+    dropout: float = 0.1
+    log_samples: int = 4
+    visualization_threshold: float = 0.5
 
 
 @dataclass

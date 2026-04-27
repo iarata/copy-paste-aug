@@ -1,0 +1,17 @@
+defaults:
+  - base_models
+  - _self_
+
+name: simple-instance-transformer
+architecture: simple_instance_transformer
+scale: null
+weights: null
+embed_dim: 128
+num_heads: 4
+encoder_layers: 2
+decoder_layers: 2
+num_queries: 20
+patch_size: 16
+dropout: 0.1
+log_samples: 4
+visualization_threshold: 0.5
