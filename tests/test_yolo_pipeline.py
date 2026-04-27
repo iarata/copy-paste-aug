@@ -7,6 +7,7 @@ import numpy as np
 from PIL import Image
 import pytest
 import torch
+from torch.utils.data import DataLoader
 
 from cpa.training import build_trainer, log_wandb_run_config, resolve_precision, update_wandb_summary
 from cpa.utils.configs import (
@@ -18,7 +19,7 @@ from cpa.utils.configs import (
     TrainingConfig,
     WandbConfig,
 )
-from cpa.yolo.data import COCOJsonDataModule
+from cpa.yolo.data import COCOJsonDataModule, RectBatchDistributedSampler
 from cpa.yolo.lightning import (
     COCOJsonSegmentationValidator,
     YOLO26LightningModule,
@@ -35,8 +36,8 @@ def _categories() -> list[dict[str, object]]:
     return [{"id": index + 1, "name": f"class_{index}"} for index in range(80)]
 
 
-def _image_record(image_id: int) -> dict[str, object]:
-    return {"id": image_id, "file_name": f"{image_id:012d}.jpg", "height": 128, "width": 128}
+def _image_record(image_id: int, *, height: int = 128, width: int = 128) -> dict[str, object]:
+    return {"id": image_id, "file_name": f"{image_id:012d}.jpg", "height": height, "width": width}
 
 
 def _annotation(ann_id: int, image_id: int) -> dict[str, object]:
@@ -49,6 +50,54 @@ def _annotation(ann_id: int, image_id: int) -> dict[str, object]:
         "area": 48.0 * 48.0,
         "iscrowd": 0,
     }
+
+
+def _variable_coco_root(tmp_path: Path) -> Path:
+    root = tmp_path / "coco2017_rect"
+    (root / "train2017").mkdir(parents=True)
+    (root / "val2017").mkdir(parents=True)
+    (root / "annotations").mkdir(parents=True)
+
+    rng = np.random.default_rng(7)
+    Image.fromarray(rng.integers(0, 255, (128, 128, 3), dtype=np.uint8)).save(
+        root / "train2017" / f"{1:012d}.jpg"
+    )
+
+    val_shapes = [
+        (160, 320),
+        (176, 320),
+        (192, 320),
+        (208, 320),
+        (320, 320),
+        (320, 256),
+        (320, 224),
+        (320, 192),
+        (320, 176),
+        (320, 160),
+    ]
+    for offset, (height, width) in enumerate(val_shapes, start=100):
+        Image.fromarray(rng.integers(0, 255, (height, width, 3), dtype=np.uint8)).save(
+            root / "val2017" / f"{offset:012d}.jpg"
+        )
+
+    train_json = {
+        "images": [_image_record(1)],
+        "annotations": [_annotation(1, 1)],
+        "categories": _categories(),
+    }
+    val_json = {
+        "images": [
+            _image_record(image_id, height=height, width=width)
+            for image_id, (height, width) in zip(range(100, 110), val_shapes, strict=True)
+        ],
+        "annotations": [
+            _annotation(index + 100, image_id) for index, image_id in enumerate(range(100, 110))
+        ],
+        "categories": _categories(),
+    }
+    (root / "annotations" / "instances_train2017.json").write_text(json.dumps(train_json), encoding="utf-8")
+    (root / "annotations" / "instances_val2017.json").write_text(json.dumps(val_json), encoding="utf-8")
+    return root
 
 
 @pytest.fixture
@@ -140,6 +189,41 @@ def test_datamodule_emits_ultralytics_batch(coco_root: Path):
     assert batch["bboxes"].shape[1] == 4
     assert batch["cls"].shape[1] == 1
     assert batch["masks"].ndim == 3
+
+
+def test_rect_validation_sampler_preserves_batch_shapes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cfg = _config(_variable_coco_root(tmp_path), aug_name="none")
+    cfg.dataset.batch_size = 4
+    datamodule = COCOJsonDataModule(cfg.dataset, project_root=Path.cwd())
+    datamodule.setup("validate")
+    assert datamodule.val_dataset is not None
+
+    for rank in range(2):
+        sampler = RectBatchDistributedSampler(
+            datamodule.val_dataset,
+            batch_size=cfg.dataset.batch_size,
+            num_replicas=2,
+            rank=rank,
+        )
+        indices = list(sampler)
+        assert len(indices) % cfg.dataset.batch_size == 0
+        for offset in range(0, len(indices), cfg.dataset.batch_size):
+            chunk = indices[offset : offset + cfg.dataset.batch_size]
+            assert len({int(datamodule.val_dataset.batch[index]) for index in chunk}) == 1
+
+        loader = DataLoader(
+            datamodule.val_dataset,
+            batch_size=cfg.dataset.batch_size,
+            sampler=sampler,
+            collate_fn=datamodule.val_dataset.collate_fn,
+        )
+        for batch in loader:
+            assert batch["img"].ndim == 4
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "1")
+    assert isinstance(datamodule.val_dataloader().sampler, RectBatchDistributedSampler)
+    assert not isinstance(datamodule.full_val_dataloader().sampler, RectBatchDistributedSampler)
 
 
 def test_lightning_module_computes_yolo26_loss(coco_root: Path):

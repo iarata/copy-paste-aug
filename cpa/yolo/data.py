@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterator
 from dataclasses import asdict, is_dataclass
 import json
+import math
+import os
 from pathlib import Path
 import random
 from typing import Any
@@ -10,7 +13,10 @@ from typing import Any
 import cv2
 import lightning as L
 import numpy as np
+import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from ultralytics.data.augment import (
     Albumentations,
     BaseMixTransform,
@@ -59,6 +65,95 @@ def load_coco_names(json_file: str | Path) -> dict[int, str]:
         coco = json.load(handle)
     categories = sorted(coco["categories"], key=lambda category: category["id"])
     return {index: category["name"] for index, category in enumerate(categories)}
+
+
+def distributed_context() -> tuple[int, int] | None:
+    if dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        try:
+            rank = int(os.environ.get("RANK", "0"))
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        except ValueError:
+            rank = 0
+            world_size = 1
+
+    if world_size <= 1:
+        return None
+    return rank, world_size
+
+
+class RectBatchDistributedSampler(DistributedSampler):
+    """Distributed sampler that preserves Ultralytics rectangular batch groups.
+
+    ``YOLODataset`` with ``rect=True`` computes one padded image shape per
+    contiguous batch. PyTorch's default distributed sampler shards validation
+    data by striding indices across ranks, which can put samples from different
+    rectangular batches into the same dataloader batch. This sampler assigns
+    whole rectangular batches to ranks and pads only with samples from the same
+    rectangular batch.
+    """
+
+    def __init__(
+        self,
+        dataset: COCOJsonDataset,
+        *,
+        batch_size: int,
+        num_replicas: int,
+        rank: int,
+        shuffle: bool = False,
+        seed: int = 0,
+    ) -> None:
+        super().__init__(
+            dataset,
+            num_replicas=num_replicas,
+            rank=rank,
+            shuffle=shuffle,
+            seed=seed,
+            drop_last=False,
+        )
+        self.batch_size = max(int(batch_size), 1)
+        self.source_batches = math.ceil(len(dataset) / self.batch_size)
+        self.batches_per_rank = math.ceil(self.source_batches / self.num_replicas) if self.source_batches else 0
+        self.num_samples = self.batches_per_rank * self.batch_size
+        self.total_size = self.num_samples * self.num_replicas
+
+    def __iter__(self) -> Iterator[int]:
+        if self.source_batches == 0:
+            return iter([])
+
+        batch_ids = list(range(self.source_batches))
+        if self.shuffle:
+            generator = torch.Generator()
+            generator.manual_seed(self.seed + self.epoch)
+            batch_ids = [batch_ids[index] for index in torch.randperm(len(batch_ids), generator=generator).tolist()]
+
+        total_batches = self.batches_per_rank * self.num_replicas
+        padding = total_batches - len(batch_ids)
+        if padding > 0:
+            batch_ids.extend(batch_ids[:padding])
+
+        start = self.rank * self.batches_per_rank
+        stop = start + self.batches_per_rank
+        rank_batch_ids = batch_ids[start:stop]
+
+        indices: list[int] = []
+        dataset_size = len(self.dataset)
+        for batch_id in rank_batch_ids:
+            batch_start = batch_id * self.batch_size
+            batch_stop = min(batch_start + self.batch_size, dataset_size)
+            batch_indices = list(range(batch_start, batch_stop))
+            if len(batch_indices) < self.batch_size:
+                batch_padding = self.batch_size - len(batch_indices)
+                repeats = math.ceil(batch_padding / len(batch_indices))
+                batch_indices.extend((batch_indices * repeats)[:batch_padding])
+            indices.extend(batch_indices)
+
+        return iter(indices)
+
+    def __len__(self) -> int:
+        return self.num_samples
 
 
 def build_yolo_hyp(cfg: Any) -> IterableSimpleNamespace:
@@ -537,13 +632,34 @@ class COCOJsonDataModule(L.LightningDataModule):
                 augmentation_cfg=self.cfg.augmentations,
             )
 
-    def _build_loader(self, dataset: COCOJsonDataset, *, batch_size: int, shuffle: bool) -> DataLoader:
+    def _build_loader(
+        self,
+        dataset: COCOJsonDataset,
+        *,
+        batch_size: int,
+        shuffle: bool,
+        distributed_rect: bool = False,
+    ) -> DataLoader:
         num_workers = int(self.cfg.num_workers)
         persistent_workers = bool(self.cfg.persistent_workers and num_workers > 0)
+        sampler = None
+        if distributed_rect and bool(getattr(dataset, "rect", False)):
+            context = distributed_context()
+            if context is not None:
+                rank, world_size = context
+                sampler = RectBatchDistributedSampler(
+                    dataset,
+                    batch_size=batch_size,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=False,
+                )
+
         return DataLoader(
             dataset,
             batch_size=batch_size,
-            shuffle=shuffle,
+            shuffle=shuffle if sampler is None else False,
+            sampler=sampler,
             num_workers=num_workers,
             pin_memory=bool(self.cfg.pin_memory),
             persistent_workers=persistent_workers,
@@ -556,6 +672,18 @@ class COCOJsonDataModule(L.LightningDataModule):
         return self._build_loader(self.train_dataset, batch_size=int(self.cfg.batch_size), shuffle=True)
 
     def val_dataloader(self) -> DataLoader:
+        if self.val_dataset is None:
+            raise RuntimeError(
+                "Call setup('validate') or setup('fit') before requesting the validation dataloader."
+            )
+        return self._build_loader(
+            self.val_dataset,
+            batch_size=int(self.eval_batch_size),
+            shuffle=False,
+            distributed_rect=True,
+        )
+
+    def full_val_dataloader(self) -> DataLoader:
         if self.val_dataset is None:
             raise RuntimeError(
                 "Call setup('validate') or setup('fit') before requesting the validation dataloader."

@@ -501,8 +501,13 @@ class YOLO26LightningModule(L.LightningModule):
         validator_cls = (
             COCOJsonSegmentationValidator if self.task == "segment" else COCOJsonDetectionValidator
         )
+        val_dataloader = (
+            datamodule.full_val_dataloader()
+            if hasattr(datamodule, "full_val_dataloader")
+            else datamodule.val_dataloader()
+        )
         validator = validator_cls(
-            dataloader=datamodule.val_dataloader(),
+            dataloader=val_dataloader,
             save_dir=output_dir,
             args=build_validator_args(data_yaml, self.cfg, int(datamodule.eval_batch_size)),
         )
@@ -698,8 +703,13 @@ def evaluate_checkpoint(
     validator_cls = (
         COCOJsonSegmentationValidator if cfg.dataset.task == "segment" else COCOJsonDetectionValidator
     )
+    val_dataloader = (
+        datamodule.full_val_dataloader()
+        if hasattr(datamodule, "full_val_dataloader")
+        else datamodule.val_dataloader()
+    )
     validator = validator_cls(
-        dataloader=datamodule.val_dataloader(),
+        dataloader=val_dataloader,
         save_dir=Path(output_dir),
         args=build_validator_args(data_yaml, cfg, int(datamodule.eval_batch_size)),
     )
