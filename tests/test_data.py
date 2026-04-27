@@ -24,6 +24,7 @@ from cpa.datasets import (
     build_train_transforms,
     build_val_transforms,
     coco_collate_fn,
+    mask_to_coco_bbox,
     polygon_to_mask,
 )
 from cpa.utils.configs import AugmentationsConfig, DatasetConfig
@@ -200,6 +201,17 @@ class TestPolygonToMask:
         mask = polygon_to_mask(poly, height=64, width=64)
         unique = set(np.unique(mask).tolist())
         assert unique.issubset({0, 1})
+
+
+class TestMaskToCocoBbox:
+    def test_returns_positive_bbox_for_single_pixel_mask(self):
+        mask = np.zeros((8, 8), dtype=np.uint8)
+        mask[3, 4] = 1
+
+        assert mask_to_coco_bbox(mask) == [4.0, 3.0, 1.0, 1.0]
+
+    def test_empty_mask_returns_none(self):
+        assert mask_to_coco_bbox(np.zeros((8, 8), dtype=np.uint8)) is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -539,6 +551,56 @@ class TestCoco2017Dataset:
         raw = ds._load_raw(0)
         assert raw["masks"].shape[0] == 0
         assert raw["bboxes"] == []
+
+    def test_degenerate_annotation_bbox_is_recomputed_from_mask(self, tmp_path):
+        img_dir = tmp_path / "imgs"
+        ann_dir = tmp_path / "anns"
+        img_dir.mkdir()
+        ann_dir.mkdir()
+
+        Image.fromarray(np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)).save(img_dir / "000000000001.jpg")
+        coco_json = {
+            "images": [{"id": 1, "file_name": "000000000001.jpg", "height": IMG_H, "width": IMG_W}],
+            "annotations": [
+                {
+                    "id": 1,
+                    "image_id": 1,
+                    "category_id": 1,
+                    "segmentation": [[10.0, 20.0, 40.0, 20.0, 40.0, 50.0, 10.0, 50.0]],
+                    "bbox": [10.0, 20.0, 30.0, 0.0],
+                    "area": 0.0,
+                    "iscrowd": 0,
+                }
+            ],
+            "categories": [{"id": 1, "name": "object"}],
+        }
+        (ann_dir / "instances.json").write_text(json.dumps(coco_json))
+
+        cfg = DatasetConfig(
+            root=str(tmp_path),
+            imgsz=IMG_SIZE,
+            batch_size=1,
+            num_workers=0,
+            pin_memory=False,
+            persistent_workers=False,
+            train_json="anns/instances.json",
+            val_json="anns/instances.json",
+            train_images="imgs",
+            val_images="imgs",
+        )
+        ds = Coco2017Dataset(
+            root=cfg.root,
+            ann_file=cfg.val_json,
+            img_dir=cfg.val_images,
+            transforms=build_val_transforms(cfg),
+            training=False,
+        )
+
+        raw = ds._load_raw(0)
+        assert raw["bboxes"][0][2] > 0
+        assert raw["bboxes"][0][3] > 0
+        sample = ds[0]
+        assert sample["masks"].shape[0] == 1
 
     # ── __repr__ ─────────────────────────────────────────────────────────────
 

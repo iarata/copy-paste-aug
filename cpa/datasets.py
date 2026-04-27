@@ -112,6 +112,23 @@ def _masks_to_tensor(masks: Any) -> torch.Tensor:
     return torch.as_tensor(np.ascontiguousarray(masks)).float()  # type: ignore[attr-defined]
 
 
+def mask_to_coco_bbox(mask: np.ndarray) -> list[float] | None:
+    """Derive a valid COCO ``[x, y, width, height]`` bbox from a binary mask."""
+    y_idx, x_idx = np.where(mask > 0)
+    if x_idx.size == 0 or y_idx.size == 0:
+        return None
+
+    x1 = float(x_idx.min())
+    y1 = float(y_idx.min())
+    x2 = float(x_idx.max() + 1)
+    y2 = float(y_idx.max() + 1)
+    width = x2 - x1
+    height = y2 - y1
+    if width <= 0 or height <= 0:
+        return None
+    return [x1, y1, width, height]
+
+
 def coco_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     """Collate a list of COCO samples into a batched dict.
 
@@ -382,9 +399,12 @@ class Coco2017Dataset(Dataset):
             if inst_mask.max() == 0:
                 continue  # skip degenerate / empty masks
 
+            bbox = mask_to_coco_bbox(inst_mask)
+            if bbox is None:
+                continue
+
             masks_list.append(inst_mask)
-            x, y, bw, bh = ann["bbox"]
-            bboxes.append([float(x), float(y), float(bw), float(bh)])
+            bboxes.append(bbox)
 
         masks = np.stack(masks_list, axis=0) if masks_list else np.empty((0, h, w), dtype=np.uint8)
         return {"image": image, "masks": masks, "bboxes": bboxes}
