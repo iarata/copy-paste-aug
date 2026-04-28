@@ -20,7 +20,7 @@ make download-coco OUTPUT=data/raw/coco2017.zip
 After downloading and **unzipping**, the COCO 2017 dataset, make sure to update the `configs/dataset/default.yaml` file with the correct path to the dataset.
 
 ## Train
-
+You must make sure that your uv env is active before running train
 ```bash
 make train
 ```
