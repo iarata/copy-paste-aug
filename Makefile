@@ -63,10 +63,14 @@ create-env:
 train:
 	uv run python -m cpa.training $(ARGS)
 
-# .PHONY train-detr
-# train-detr:
-	# uv run python -m cpa.training --config-name instance_transformer_aug
-	# uv run python -m cpa.training --config-name instance_transformer_no_aug
+.PHONY: download-coco
+download-coco:
+ifeq ($(OUTPUT),)
+	$(error OUTPUT is required. Usage: make download-coco OUTPUT=/path/to/file.zip)
+endif
+	curl -L -o $(OUTPUT) \
+		https://www.kaggle.com/api/v1/datasets/download/awsaf49/coco-2017-dataset
+
 
 ## Run evaluation
 .PHONY: eval

@@ -6,15 +6,44 @@
 
 Copy-Paste Augmentation for ADLCV 2026 Spring
 
+## Install
+
+```bash
+make requirements
+```
+
+## Data (full COCO-2017)
+
+```bash
+make download-coco OUTPUT=data/raw/coco2017.zip
+```
+After downloading and **unzipping**, the COCO 2017 dataset, make sure to update the `configs/dataset/default.yaml` file with the correct path to the dataset.
+
+## Train
+
+```bash
+make train
+```
+
+Useful overrides:
+
+```bash
+make train ARGS="dataset.batch_size=16"
+make train ARGS="models.scale=s"
+make train ARGS="dataset.augmentations.name=none"
+make train ARGS="dataset.augmentations.name=cpa dataset.augmentations.prob=1.0"
+make train ARGS="models.name=configs/models/yolo26/yolo26-p6.yaml"
+make train ARGS="models.name=yolo26-seg.yaml models.scale=m"
+make train ARGS="training.limit_train_batches=10 training.limit_val_batches=10 evaluation.run_after_fit=false"
+
+# if debug is True it will run on fast-dev mode which just runs 1 epoch
+make train ARGS="debug=true"
+
+# training DEITR transformer with/without copy-paste augmentation
+make train ARGS="--config-name instance_transformer_no_aug debug=False dataset.batch_size=32 evaluation.run_epoch_metrics=false"
+make train ARGS="--config-name instance_transformer_aug debug=False dataset.batch_size=32 evaluation.run_epoch_metrics=false"
+```
 ## YOLO26 Pipeline
-
-The repo now includes a Hydra-driven YOLO26 training and evaluation pipeline built around:
-
-- Ultralytics YOLO26 models
-- Lightning for training orchestration
-- PyTorch optimizers/schedulers
-- Weights & Biases logging
-- Direct COCO JSON loading, so COCO annotations stay the source of truth
 
 The default setup targets COCO 2017 instance segmentation trained from scratch:
 
@@ -33,31 +62,6 @@ Copy-paste experiment options:
 - `dataset.augmentations.name=ultralytics_mixup`
 - `dataset.augmentations.name=cpa`
 
-### Install
-
-```bash
-make requirements
-```
-
-### Train
-
-```bash
-make train
-```
-
-Useful overrides:
-
-```bash
-make train ARGS="dataset.batch_size=16"
-make train ARGS="models.scale=s"
-make train ARGS="dataset.augmentations.name=none"
-make train ARGS="dataset.augmentations.name=cpa dataset.augmentations.prob=1.0"
-make train ARGS="models.name=configs/models/yolo26/yolo26-p6.yaml"
-make train ARGS="models.name=yolo26-seg.yaml models.scale=m"
-make train ARGS="training.limit_train_batches=10 training.limit_val_batches=10 evaluation.run_after_fit=false"
-make train ARGS="debug=true"
-```
-
 ### Evaluate
 
 ```bash
@@ -67,6 +71,8 @@ make eval ARGS="evaluation.checkpoint_path=/abs/path/to/checkpoints/last.ckpt"
 Evaluation writes metrics to `evaluation/metrics.json` inside the Hydra run directory and uses the Ultralytics validators for COCO-style metrics.
 During training, epoch-end validator metrics can be toggled with `evaluation.run_epoch_metrics=true|false`. When enabled, they run at the end of every epoch, are written under `validation_benchmark/epoch_XXX/metrics.json`, and are logged to W&B with `val/*` and `benchmark/*` series such as `val/mAP50`, `val/mAP50-95`, `val/precision`, `val/recall`, `val/f1`, `benchmark/mAP50-95`, and `benchmark/inference_ms_per_image`.
 Training and validation losses are logged epoch-wise so W&B charts line up with the validator metrics on the same epoch axis.
+
+-------------
 
 ## Project Organization
 
