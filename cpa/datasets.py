@@ -36,6 +36,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from cpa.augs import CopyPaste
 from cpa.utils.configs import DatasetConfig
+from cpa.utils.dataset_subset import subset_sequence, validate_subset_percent
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -67,6 +68,14 @@ def _cfg_train_images(cfg: DatasetConfig) -> str:
 
 def _cfg_val_images(cfg: DatasetConfig) -> str:
     return str(getattr(cfg, "val_img_dir", getattr(cfg, "val_images")))
+
+
+def _cfg_train_subset_percent(cfg: DatasetConfig) -> float:
+    return float(getattr(cfg, "train_subset_percent", 100.0))
+
+
+def _cfg_val_subset_percent(cfg: DatasetConfig) -> float:
+    return float(getattr(cfg, "val_subset_percent", 100.0))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Low-level helpers
@@ -285,6 +294,8 @@ class Coco2017Dataset(Dataset):
         img_dir: str,
         transforms: A.Compose,
         training: bool = False,
+        subset_percent: float = 100.0,
+        subset_seed: int = 0,
     ) -> None:
         super().__init__()
 
@@ -292,6 +303,8 @@ class Coco2017Dataset(Dataset):
         self.img_dir = self.root / img_dir
         self._full_transforms = transforms
         self.training = training
+        self.subset_percent = validate_subset_percent(subset_percent)
+        self.subset_seed = int(subset_seed)
 
         # Lazily populated by _split_transforms()
         self._pre_tf: A.Compose | None = None
@@ -306,8 +319,10 @@ class Coco2017Dataset(Dataset):
         with ann_path.open("r", encoding="utf-8") as fh:
             coco: dict = json.load(fh)
 
+        images = subset_sequence(list(coco["images"]), self.subset_percent, self.subset_seed)
+
         # image_id → image metadata
-        self._img_info: dict[int, dict] = {img["id"]: img for img in coco["images"]}
+        self._img_info: dict[int, dict] = {img["id"]: img for img in images}
 
         # image_id → list of non-crowd annotations
         ann_by_img: dict[int, list[dict]] = {img_id: [] for img_id in self._img_info}
@@ -519,9 +534,10 @@ class Coco2017DataModule(L.LightningDataModule):
             ...
     """
 
-    def __init__(self, cfg: DatasetConfig) -> None:
+    def __init__(self, cfg: DatasetConfig, seed: int = 0) -> None:
         super().__init__()
         self.cfg = cfg
+        self.seed = int(seed)
         self.train_ds: Coco2017Dataset | None = None
         self.val_ds: Coco2017Dataset | None = None
 
@@ -543,6 +559,8 @@ class Coco2017DataModule(L.LightningDataModule):
                 img_dir=_cfg_train_images(cfg),
                 transforms=build_train_transforms(cfg),
                 training=True,
+                subset_percent=_cfg_train_subset_percent(cfg),
+                subset_seed=self.seed,
             )
 
         if stage in ("fit", "validate", None):
@@ -552,6 +570,8 @@ class Coco2017DataModule(L.LightningDataModule):
                 img_dir=_cfg_val_images(cfg),
                 transforms=build_val_transforms(cfg),
                 training=False,
+                subset_percent=_cfg_val_subset_percent(cfg),
+                subset_seed=self.seed,
             )
 
     def train_dataloader(self) -> DataLoader:

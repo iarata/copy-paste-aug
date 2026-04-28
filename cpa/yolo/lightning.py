@@ -647,6 +647,11 @@ class COCOJsonDetectionValidator(DetectionValidator):
             self.class_map = converter.coco80_to_coco91_class()
             self.args.save_json |= self.args.val and not self.training
 
+    def eval_json(self, stats: dict[str, Any]) -> dict[str, Any]:
+        pred_json = self.save_dir / "predictions.json"
+        anno_json = _annotation_json_from_data(self.data, split=str(self.args.split), is_coco=self.is_coco)
+        return self.coco_evaluate(stats, pred_json, anno_json)
+
 
 class COCOJsonSegmentationValidator(SegmentationValidator):
     def init_metrics(self, model: torch.nn.Module) -> None:
@@ -655,6 +660,22 @@ class COCOJsonSegmentationValidator(SegmentationValidator):
             self.is_coco = True
             self.class_map = converter.coco80_to_coco91_class()
             self.args.save_json |= self.args.val and not self.training
+
+    def eval_json(self, stats: dict[str, Any]) -> dict[str, Any]:
+        pred_json = self.save_dir / "predictions.json"
+        anno_json = _annotation_json_from_data(self.data, split=str(self.args.split), is_coco=self.is_coco)
+        return super().coco_evaluate(stats, pred_json, anno_json, ["bbox", "segm"], suffix=["Box", "Mask"])
+
+
+def _annotation_json_from_data(data: dict[str, Any], *, split: str, is_coco: bool) -> Path:
+    explicit_json = data.get(f"{split}_json")
+    if explicit_json:
+        annotation_json = Path(str(explicit_json))
+        return annotation_json if annotation_json.is_absolute() else Path(data["path"]) / annotation_json
+
+    dataset_path = Path(data["path"])
+    filename = "instances_val2017.json" if is_coco else f"lvis_v1_{split}.json"
+    return dataset_path / "annotations" / filename
 
 
 def build_validator_args(data_yaml: Path, cfg: Any, batch_size: int) -> dict[str, Any]:

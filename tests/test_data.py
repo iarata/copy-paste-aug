@@ -356,6 +356,40 @@ class TestCoco2017Dataset:
     def test_val_len(self, base_cfg):
         assert len(self._val_ds(base_cfg)) == N_VAL
 
+    def test_subset_percent_reduces_images_deterministically(self, base_cfg):
+        ds1 = Coco2017Dataset(
+            root=base_cfg.root,
+            ann_file=base_cfg.train_json,
+            img_dir=base_cfg.train_images,
+            transforms=build_train_transforms(base_cfg),
+            training=True,
+            subset_percent=50.0,
+            subset_seed=123,
+        )
+        ds2 = Coco2017Dataset(
+            root=base_cfg.root,
+            ann_file=base_cfg.train_json,
+            img_dir=base_cfg.train_images,
+            transforms=build_train_transforms(base_cfg),
+            training=True,
+            subset_percent=50.0,
+            subset_seed=123,
+        )
+
+        assert len(ds1) == math.ceil(N_TRAIN * 0.5)
+        assert ds1._image_ids == ds2._image_ids
+
+    def test_subset_percent_must_be_in_valid_range(self, base_cfg):
+        with pytest.raises(ValueError, match="Subset percentage"):
+            Coco2017Dataset(
+                root=base_cfg.root,
+                ann_file=base_cfg.train_json,
+                img_dir=base_cfg.train_images,
+                transforms=build_train_transforms(base_cfg),
+                training=True,
+                subset_percent=0.0,
+            )
+
     def test_train_mode_splits_pipeline(self, base_cfg):
         """Training dataset must populate all three split-transform attributes."""
         ds = self._train_ds(base_cfg)
@@ -645,6 +679,18 @@ class TestCoco2017DataModule:
         dm.setup("fit")
         assert dm.val_ds is not None
         assert dm.val_ds.training is False
+
+    def test_setup_applies_train_and_val_subset_percent(self, base_cfg):
+        base_cfg.train_subset_percent = 50.0
+        base_cfg.val_subset_percent = 50.0
+
+        dm = Coco2017DataModule(base_cfg, seed=123)
+        dm.setup("fit")
+
+        assert dm.train_ds is not None
+        assert dm.val_ds is not None
+        assert len(dm.train_ds) == math.ceil(N_TRAIN * 0.5)
+        assert len(dm.val_ds) == math.ceil(N_VAL * 0.5)
 
     # ── RuntimeError before setup ─────────────────────────────────────────────
 

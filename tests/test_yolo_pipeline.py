@@ -8,6 +8,7 @@ from PIL import Image
 import pytest
 import torch
 from torch.utils.data import DataLoader
+import yaml
 
 from cpa.training import build_trainer, log_wandb_run_config, resolve_precision, update_wandb_summary
 from cpa.utils.configs import (
@@ -189,6 +190,41 @@ def test_datamodule_emits_ultralytics_batch(coco_root: Path):
     assert batch["bboxes"].shape[1] == 4
     assert batch["cls"].shape[1] == 1
     assert batch["masks"].ndim == 3
+
+
+def test_datamodule_applies_subset_percent(coco_root: Path):
+    cfg = _config(coco_root, aug_name="none")
+    cfg.seed = 123
+    cfg.dataset.train_subset_percent = 50.0
+    cfg.dataset.val_subset_percent = 50.0
+
+    datamodule = COCOJsonDataModule(cfg.dataset, project_root=Path.cwd(), seed=cfg.seed)
+    datamodule.setup("fit")
+
+    assert datamodule.train_dataset is not None
+    assert datamodule.val_dataset is not None
+    assert len(datamodule.train_dataset) == 1
+    assert len(datamodule.val_dataset) == 1
+
+
+def test_data_yaml_uses_subset_annotation_json(tmp_path: Path):
+    cfg = _config(_variable_coco_root(tmp_path), aug_name="none")
+    cfg.seed = 17
+    cfg.dataset.val_subset_percent = 30.0
+
+    datamodule = COCOJsonDataModule(cfg.dataset, project_root=Path.cwd(), seed=cfg.seed)
+    datamodule.setup("validate")
+    data_yaml = datamodule.write_data_yaml(tmp_path / "eval" / "coco_data.yaml")
+    payload = yaml.safe_load(data_yaml.read_text(encoding="utf-8"))
+    val_json = Path(payload["val_json"])
+
+    assert val_json.exists()
+    with val_json.open("r", encoding="utf-8") as handle:
+        subset_coco = json.load(handle)
+    assert len(subset_coco["images"]) == 3
+    assert {annotation["image_id"] for annotation in subset_coco["annotations"]}.issubset(
+        {image["id"] for image in subset_coco["images"]}
+    )
 
 
 def test_rect_validation_sampler_preserves_batch_shapes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

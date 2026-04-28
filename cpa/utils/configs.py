@@ -54,6 +54,8 @@ class DatasetConfig:
     persistent_workers: bool = True
     cache: bool = False
     coco_eval: bool = True
+    train_subset_percent: float = 100.0
+    val_subset_percent: float = 100.0
     augmentations: AugmentationsConfig = field(default_factory=AugmentationsConfig)
 
 

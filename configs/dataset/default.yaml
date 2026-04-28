@@ -16,6 +16,8 @@ pin_memory: false
 persistent_workers: true
 cache: false
 coco_eval: true
+train_subset_percent: 100.0
+val_subset_percent: 100.0
 
 augmentations:
   name: cpa

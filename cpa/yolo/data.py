@@ -43,6 +43,7 @@ from ultralytics.utils.tqdm import TQDM
 import yaml
 
 from cpa.augs.copy_paste import extract_bboxes, image_copy_paste
+from cpa.utils.dataset_subset import subset_sequence, validate_subset_percent, write_coco_subset_json
 
 
 def _cfg_to_dict(cfg: Any) -> Any:
@@ -441,9 +442,19 @@ def build_train_transforms(
 class COCOJsonDataset(YOLODataset):
     """YOLODataset that reads COCO JSON directly and supports configurable copy-paste variants."""
 
-    def __init__(self, *args: Any, json_file: str, augmentation_cfg: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        json_file: str,
+        augmentation_cfg: Any,
+        subset_percent: float = 100.0,
+        subset_seed: int = 0,
+        **kwargs: Any,
+    ) -> None:
         self.json_file = str(json_file)
         self.augmentation_cfg = augmentation_cfg
+        self.subset_percent = validate_subset_percent(subset_percent)
+        self.subset_seed = int(subset_seed)
         super().__init__(*args, **kwargs)
 
     def get_img_files(self, img_path: str | list[str]) -> list[str]:
@@ -464,7 +475,8 @@ class COCOJsonDataset(YOLODataset):
         for annotation in coco["annotations"]:
             annotations_by_image[annotation["image_id"]].append(annotation)
 
-        for image_info in TQDM(coco["images"], desc=f"reading {Path(self.json_file).name}"):
+        image_infos = subset_sequence(list(coco["images"]), self.subset_percent, self.subset_seed)
+        for image_info in TQDM(image_infos, desc=f"reading {Path(self.json_file).name}"):
             height, width = image_info["height"], image_info["width"]
             image_file = Path(self.img_path) / image_info["file_name"]
             if not image_file.exists():
@@ -521,7 +533,9 @@ class COCOJsonDataset(YOLODataset):
                 }
             )
 
-        cache["hash"] = get_hash([self.json_file, str(self.img_path)])
+        cache["hash"] = get_hash(
+            [self.json_file, str(self.img_path), str(self.subset_percent), str(self.subset_seed)]
+        )
         save_dataset_cache_file(self.prefix, path, cache, DATASET_CACHE_VERSION)
         return cache
 
@@ -530,7 +544,9 @@ class COCOJsonDataset(YOLODataset):
         try:
             cache = load_dataset_cache_file(cache_path)
             assert cache["version"] == DATASET_CACHE_VERSION
-            assert cache["hash"] == get_hash([self.json_file, str(self.img_path)])
+            assert cache["hash"] == get_hash(
+                [self.json_file, str(self.img_path), str(self.subset_percent), str(self.subset_seed)]
+            )
             self.im_files = [label["im_file"] for label in cache["labels"]]
         except (FileNotFoundError, AssertionError, AttributeError, KeyError, ModuleNotFoundError):
             cache = self.cache_labels(cache_path)
@@ -563,16 +579,25 @@ class COCOJsonDataset(YOLODataset):
 
 
 class COCOJsonDataModule(L.LightningDataModule):
-    def __init__(self, cfg: Any, project_root: Path, eval_batch_size: int | None = None) -> None:
+    def __init__(
+        self,
+        cfg: Any,
+        project_root: Path,
+        eval_batch_size: int | None = None,
+        seed: int = 0,
+    ) -> None:
         super().__init__()
         self.cfg = cfg
         self.project_root = project_root
+        self.seed = int(seed)
         self.root = resolve_path(cfg.root, project_root)
         self.train_json = resolve_path(cfg.train_json, self.root)
         self.val_json = resolve_path(cfg.val_json, self.root)
         self.train_images = resolve_path(cfg.train_images, self.root)
         self.val_images = resolve_path(cfg.val_images, self.root)
         self.eval_batch_size = eval_batch_size or cfg.batch_size
+        self.train_subset_percent = validate_subset_percent(getattr(cfg, "train_subset_percent", 100.0))
+        self.val_subset_percent = validate_subset_percent(getattr(cfg, "val_subset_percent", 100.0))
         self.names = load_coco_names(self.train_json)
         self.data = {
             "path": str(self.root),
@@ -584,6 +609,8 @@ class COCOJsonDataModule(L.LightningDataModule):
             "names": self.names,
             "channels": 3,
             "coco_eval": bool(getattr(cfg, "coco_eval", False)),
+            "train_subset_percent": self.train_subset_percent,
+            "val_subset_percent": self.val_subset_percent,
         }
         self.hyp = build_yolo_hyp(cfg.augmentations)
         self.train_dataset: COCOJsonDataset | None = None
@@ -609,6 +636,8 @@ class COCOJsonDataModule(L.LightningDataModule):
                 data=self.data,
                 task=self.cfg.task,
                 augmentation_cfg=self.cfg.augmentations,
+                subset_percent=self.train_subset_percent,
+                subset_seed=self.seed,
             )
 
         if stage in {None, "fit", "validate"}:
@@ -630,6 +659,8 @@ class COCOJsonDataModule(L.LightningDataModule):
                 data=self.data,
                 task=self.cfg.task,
                 augmentation_cfg=self.cfg.augmentations,
+                subset_percent=self.val_subset_percent,
+                subset_seed=self.seed,
             )
 
     def _build_loader(
@@ -693,16 +724,50 @@ class COCOJsonDataModule(L.LightningDataModule):
     def write_data_yaml(self, output_file: str | Path) -> Path:
         output_path = Path(output_file)
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        train_json = self._data_yaml_json_path(
+            self.train_json,
+            output_path.parent,
+            split="train",
+            subset_percent=self.train_subset_percent,
+        )
+        val_json = self._data_yaml_json_path(
+            self.val_json,
+            output_path.parent,
+            split="val",
+            subset_percent=self.val_subset_percent,
+        )
         payload = {
             "path": str(self.root),
             "train": str(self.train_images),
             "val": str(self.val_images),
-            "train_json": str(self.train_json),
-            "val_json": str(self.val_json),
+            "train_json": str(train_json),
+            "val_json": str(val_json),
             "nc": len(self.names),
             "names": self.names,
             "channels": 3,
             "coco_eval": bool(getattr(self.cfg, "coco_eval", False)),
+            "train_subset_percent": self.train_subset_percent,
+            "val_subset_percent": self.val_subset_percent,
         }
         output_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
         return output_path
+
+    def _data_yaml_json_path(
+        self,
+        source_json: Path,
+        output_dir: Path,
+        *,
+        split: str,
+        subset_percent: float,
+    ) -> Path:
+        if subset_percent >= 100.0:
+            return source_json
+
+        percent_label = f"{subset_percent:g}".replace(".", "p")
+        output_json = output_dir / f"{source_json.stem}.{split}_subset_{percent_label}pct_seed{self.seed}.json"
+        return write_coco_subset_json(
+            source_json,
+            output_json,
+            percent=subset_percent,
+            seed=self.seed,
+        )
