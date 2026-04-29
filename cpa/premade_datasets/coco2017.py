@@ -17,7 +17,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from collections.abc import Iterable
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 import hashlib
 import json
@@ -132,6 +132,7 @@ class PremadeCocoConfig:
     link_mode: str = "symlink"
     workers: int = 1
     parallel_backend: str = "thread"
+    max_in_flight: int | None = None
     show_progress: bool = True
     log_level: str = "INFO"
     resume: bool = False
@@ -350,10 +351,11 @@ def build_premade_coco2017(config: PremadeCocoConfig) -> Path:
         first_image_id=next_image_id,
     )
     logger.info(
-        "Generating {} augmented images with {} backend and {} worker(s)",
+        "Generating {} augmented images with {} backend, {} worker(s), and {} max in-flight task(s)",
         len(generation_tasks),
         config.parallel_backend,
         config.workers,
+        _effective_max_in_flight(config, len(generation_tasks)),
     )
 
     generated_records: list[GeneratedImageRecord] = []
@@ -504,6 +506,8 @@ def _validate_config(config: PremadeCocoConfig) -> None:
         raise ValueError("link_mode must be one of: symlink, copy, hardlink.")
     if config.workers < 1:
         raise ValueError("workers must be >= 1.")
+    if config.max_in_flight is not None and config.max_in_flight < 1:
+        raise ValueError("max_in_flight must be >= 1 when set.")
     if config.parallel_backend not in {"thread", "process"}:
         raise ValueError("parallel_backend must be one of: thread, process.")
     if config.overwrite and config.resume:
@@ -619,28 +623,70 @@ def _run_generation_tasks(
         return sorted(results, key=lambda result: result.task_index)
 
     executor_cls = ThreadPoolExecutor if config.parallel_backend == "thread" else ProcessPoolExecutor
+    max_in_flight = _effective_max_in_flight(config, len(tasks))
     results: list[AugmentationResult] = []
     with executor_cls(max_workers=config.workers) as executor:
-        futures = [
-            executor.submit(
-                _generate_augmented_image_task,
-                task,
-                source_image_dir,
-                output_image_dir,
-                resume_dir,
-                config,
+        task_iter = iter(tasks)
+        pending: set[Future[AugmentationResult]] = set()
+
+        def submit_next() -> bool:
+            try:
+                task = next(task_iter)
+            except StopIteration:
+                return False
+            pending.add(
+                executor.submit(
+                    _generate_augmented_image_task,
+                    task,
+                    source_image_dir,
+                    output_image_dir,
+                    resume_dir,
+                    config,
+                )
             )
-            for task in tasks
-        ]
-        for future in tqdm(
-            as_completed(futures),
-            total=len(futures),
+            return True
+
+        for _ in range(min(max_in_flight, len(tasks))):
+            submit_next()
+
+        progress = tqdm(
+            total=len(tasks),
             desc="copy-paste images",
             disable=not config.show_progress,
-        ):
-            results.append(future.result())
+        )
+        try:
+            with progress:
+                while pending:
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        results.append(future.result())
+                        progress.update(1)
+                        submit_next()
+        except BaseException:
+            for future in pending:
+                future.cancel()
+            raise
 
     return sorted(results, key=lambda result: result.task_index)
+
+
+def _effective_max_in_flight(config: PremadeCocoConfig, task_count: int) -> int:
+    if task_count <= 0:
+        return 0
+    if config.workers == 1:
+        return 1
+    if config.max_in_flight is not None:
+        return min(int(config.max_in_flight), task_count)
+    if _uses_harmonized_accelerator(config):
+        return 1
+    return min(max(1, config.workers * 2), task_count)
+
+
+def _uses_harmonized_accelerator(config: PremadeCocoConfig) -> bool:
+    if config.method != HarmonizedCopyPasteMethod.name:
+        return False
+    requested = str(config.harmonization_device).strip().lower()
+    return requested == "auto" or requested == "mps" or requested.startswith("cuda") or requested.isdigit()
 
 
 def _generate_augmented_image_task(
@@ -1374,6 +1420,15 @@ def parse_args(argv: list[str] | None = None) -> PremadeCocoConfig:
     parser.add_argument("--link-mode", choices=("symlink", "copy", "hardlink"), default="symlink")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--parallel-backend", choices=("thread", "process"), default="thread")
+    parser.add_argument(
+        "--max-in-flight",
+        type=int,
+        default=None,
+        help=(
+            "Maximum submitted generation tasks waiting/running at once. "
+            "Defaults to workers*2, except harmonized accelerator runs default to 1."
+        ),
+    )
     parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument(

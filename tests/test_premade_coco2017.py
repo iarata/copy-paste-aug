@@ -11,6 +11,7 @@ from PIL import Image
 import pytest
 import torch
 
+from cpa.premade_datasets import coco2017 as premade_coco2017
 from cpa.premade_datasets import harmonized_copy_paste
 from cpa.premade_datasets.coco2017 import (
     PremadeCocoConfig,
@@ -352,6 +353,47 @@ def test_libcom_premade_imports_do_not_execute_top_level_init(monkeypatch: pytes
     assert getattr(sys.modules["libcom"], "__file__", None) is None
     assert "libcom.shadow_generation" not in sys.modules
     assert "libcom.reflection_generation" not in sys.modules
+
+
+def test_harmonized_accelerator_caps_default_in_flight(tmp_path: Path):
+    source = tmp_path / "source"
+    config = PremadeCocoConfig(
+        source_root=source,
+        output_root=tmp_path / "out",
+        method="harmonized",
+        harmonization_device="cuda",
+        workers=12,
+    )
+
+    assert premade_coco2017._effective_max_in_flight(config, 100) == 1
+    assert premade_coco2017._effective_max_in_flight(config, 0) == 0
+    assert (
+        premade_coco2017._effective_max_in_flight(
+            PremadeCocoConfig(
+                source_root=source,
+                output_root=tmp_path / "out_override",
+                method="harmonized",
+                harmonization_device="cuda",
+                workers=12,
+                max_in_flight=3,
+            ),
+            100,
+        )
+        == 3
+    )
+    assert (
+        premade_coco2017._effective_max_in_flight(
+            PremadeCocoConfig(
+                source_root=source,
+                output_root=tmp_path / "out_cpu",
+                method="harmonized",
+                harmonization_device="cpu",
+                workers=12,
+            ),
+            100,
+        )
+        == 24
+    )
 
 
 def test_cleanup_removes_original_symlink_aliases_and_keeps_dataset_loadable(tmp_path: Path):

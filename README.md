@@ -90,10 +90,13 @@ for multiprocessing, and `--no-progress` to disable tqdm progress bars.  Loguru
 logging is enabled by the CLI and can be controlled with `--log-level`.  If a
 long premade build is interrupted, rerun the same command with `--resume`; valid
 completed augmented images are reused and only missing/corrupt tasks are
-generated again.  By default, source-image symlink aliases are removed from the
-output tree after a successful build and original-image COCO records point back
-to the source COCO files.  Pass `--no-cleanup-aliases` if you want to keep those
-symlinks in the output folder.
+generated again.  The executor only keeps a bounded number of submitted tasks in
+memory; override it with `--max-in-flight N` if needed.  Harmonized CUDA/MPS runs
+default to `--max-in-flight 1` because the GPU model is serialized internally.
+By default, source-image symlink aliases are removed from the output tree after a
+successful build and original-image COCO records point back to the source COCO
+files.  Pass `--no-cleanup-aliases` if you want to keep those symlinks in the
+output folder.
 To train on the premade dataset, point the dataset config at the generated root
 and disable online augmentation:
 
