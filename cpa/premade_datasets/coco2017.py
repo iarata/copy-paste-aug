@@ -36,6 +36,10 @@ from tqdm.auto import tqdm
 import yaml
 
 from cpa.augs.copy_paste import image_copy_paste
+from cpa.premade_datasets.harmonized_copy_paste import (
+    HarmonizedCopyPasteMethod,
+    normalize_harmonization_model_type,
+)
 from cpa.utils.dataset_subset import subset_indices, validate_subset_percent
 
 logger.disable(__name__)
@@ -115,6 +119,10 @@ class PremadeCocoConfig:
     flip_prob: float = 0.5
     blend: bool = True
     sigma: float = 3.0
+    harmonization_model_type: str = "PCTNet"
+    harmonization_device: str = "auto"
+    harmonization_steps: int = 4
+    harmonization_resolution: int = 1024
     link_mode: str = "symlink"
     workers: int = 1
     parallel_backend: str = "thread"
@@ -221,6 +229,7 @@ class SimpleCopyPasteMethod:
 
 METHOD_REGISTRY: dict[str, type[CopyPasteMethod]] = {
     SimpleCopyPasteMethod.name: SimpleCopyPasteMethod,
+    HarmonizedCopyPasteMethod.name: HarmonizedCopyPasteMethod,
 }
 
 
@@ -444,6 +453,12 @@ def _validate_config(config: PremadeCocoConfig) -> None:
         raise ValueError("workers must be >= 1.")
     if config.parallel_backend not in {"thread", "process"}:
         raise ValueError("parallel_backend must be one of: thread, process.")
+    if config.method == HarmonizedCopyPasteMethod.name:
+        normalize_harmonization_model_type(config.harmonization_model_type)
+        if config.harmonization_steps < 1:
+            raise ValueError("harmonization_steps must be >= 1.")
+        if config.harmonization_resolution < 8 or config.harmonization_resolution % 8 != 0:
+            raise ValueError("harmonization_resolution must be >= 8 and divisible by 8.")
 
 
 def _effective_val_subset_percent(config: PremadeCocoConfig) -> float:
@@ -497,7 +512,12 @@ def _build_generation_tasks(
         base_image_id = int(base_image["id"])
         for aug_index in range(config.augmented_per_image):
             task_index = len(tasks)
-            rng_seed = _stable_task_seed(config.seed, config.method, base_image_id, aug_index)
+            rng_seed = _stable_task_seed(
+                config.seed,
+                _randomness_method_key(config.method),
+                base_image_id,
+                aug_index,
+            )
             paste_image = _choose_paste_image(
                 image_by_id=image_by_id,
                 image_ids=image_ids,
@@ -647,6 +667,14 @@ def _stable_task_seed(global_seed: int, method: str, base_image_id: int, aug_ind
     payload = f"{global_seed}:{method}:{base_image_id}:{aug_index}".encode("utf-8")
     digest = hashlib.sha256(payload).digest()
     return int.from_bytes(digest[:8], "big", signed=False)
+
+
+def _randomness_method_key(method: str) -> str:
+    """Methods that extend simple copy-paste must share its random stream."""
+
+    if method == HarmonizedCopyPasteMethod.name:
+        return SimpleCopyPasteMethod.name
+    return method
 
 
 def _materialize_original_images(
@@ -993,6 +1021,18 @@ def parse_args(argv: list[str] | None = None) -> PremadeCocoConfig:
     parser.add_argument("--flip-prob", type=float, default=0.5)
     parser.add_argument("--blend", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sigma", type=float, default=3.0)
+    parser.add_argument(
+        "--harmonization-model-type",
+        default="PCTNet",
+        help="Libcom direct model backend: PCTNet, PCNet alias, or LBM.",
+    )
+    parser.add_argument(
+        "--harmonization-device",
+        default="auto",
+        help="Device for harmonization: auto, cpu, mps, cuda, cuda:N, or CUDA device id.",
+    )
+    parser.add_argument("--harmonization-steps", type=int, default=4)
+    parser.add_argument("--harmonization-resolution", type=int, default=1024)
     parser.add_argument("--link-mode", choices=("symlink", "copy", "hardlink"), default="symlink")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--parallel-backend", choices=("thread", "process"), default="thread")

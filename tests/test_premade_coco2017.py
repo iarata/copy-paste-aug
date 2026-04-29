@@ -6,7 +6,10 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+import pytest
+import torch
 
+from cpa.premade_datasets import harmonized_copy_paste
 from cpa.premade_datasets.coco2017 import (
     PremadeCocoConfig,
     build_premade_coco2017,
@@ -110,6 +113,12 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _first_generated_image(output_root: Path) -> np.ndarray:
+    manifest = json.loads((output_root / "manifest.json").read_text(encoding="utf-8"))
+    file_name = manifest["generated_images"][0]["file_name"]
+    return np.asarray(Image.open(output_root / "train2017" / file_name).convert("RGB"), dtype=np.uint8)
+
+
 def test_category_balanced_subset_keeps_each_class_coverage(tmp_path: Path):
     source = _make_source_coco(tmp_path / "source")
     coco = json.loads((source / "annotations" / "instances_train2017.json").read_text(encoding="utf-8"))
@@ -192,6 +201,82 @@ def test_build_premade_coco_is_reproducible_and_separate(tmp_path: Path):
     assert (source / "annotations" / "instances_train2017.json").exists()
     assert (output_a / "annotations" / "instances_train2017.json").exists()
     assert output_a != source
+
+
+def test_harmonized_method_preserves_simple_randomness_with_identity_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source = _make_source_coco(tmp_path / "source")
+    output_simple = tmp_path / "simple"
+    output_harmonized = tmp_path / "harmonized"
+    calls: list[tuple[tuple[int, ...], int]] = []
+
+    class IdentityHarmonizer:
+        def __call__(self, composite_image: np.ndarray, composite_mask: np.ndarray, **kwargs):
+            calls.append((composite_image.shape, int(composite_mask.max())))
+            return composite_image
+
+    monkeypatch.setattr(
+        harmonized_copy_paste,
+        "_get_harmonization_model",
+        lambda config: IdentityHarmonizer(),
+    )
+    common = {
+        "source_root": source,
+        "seed": 23,
+        "train_subset_percent": 50.0,
+        "copy_paste_percent": 50.0,
+        "objects_paste_percent": 100.0,
+        "scale_min": 1.0,
+        "scale_max": 1.0,
+        "flip_prob": 0.0,
+        "blend": False,
+        "link_mode": "copy",
+        "show_progress": False,
+    }
+
+    build_premade_coco2017(PremadeCocoConfig(output_root=output_simple, method="simple", **common))
+    build_premade_coco2017(
+        PremadeCocoConfig(
+            output_root=output_harmonized,
+            method="harmonized",
+            harmonization_model_type="PCNet",
+            harmonization_device="cpu",
+            **common,
+        )
+    )
+
+    simple_manifest = json.loads((output_simple / "manifest.json").read_text(encoding="utf-8"))
+    harmonized_manifest = json.loads((output_harmonized / "manifest.json").read_text(encoding="utf-8"))
+
+    assert simple_manifest["selected_train_image_ids"] == harmonized_manifest["selected_train_image_ids"]
+    assert [
+        (record["base_image_id"], record["paste_image_id"], record["paste_annotation_ids"])
+        for record in simple_manifest["generated_images"]
+    ] == [
+        (record["base_image_id"], record["paste_image_id"], record["paste_annotation_ids"])
+        for record in harmonized_manifest["generated_images"]
+    ]
+    np.testing.assert_array_equal(
+        _first_generated_image(output_simple), _first_generated_image(output_harmonized)
+    )
+    assert calls
+    assert calls[0][1] == 255
+
+
+def test_harmonized_device_and_dtype_helpers(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+
+    assert harmonized_copy_paste._resolve_device("auto") == torch.device("cpu")
+    assert harmonized_copy_paste._resolve_device("cpu") == torch.device("cpu")
+    with pytest.raises(ValueError, match="MPS"):
+        harmonized_copy_paste._resolve_device("mps")
+    assert harmonized_copy_paste._resolve_dtype("LBM", torch.device("cpu")) == torch.float32
+    assert harmonized_copy_paste._resolve_dtype("LBM", torch.device("mps")) == torch.float32
+    assert harmonized_copy_paste._resolve_dtype("LBM", torch.device("cuda:0")) == torch.bfloat16
+    assert harmonized_copy_paste.normalize_harmonization_model_type("PCNet") == "PCTNet"
 
 
 def test_parallel_backends_match_single_worker_output(tmp_path: Path):

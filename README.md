@@ -101,8 +101,28 @@ make train ARGS="\
   dataset.augmentations.name=none"
 ```
 
-The generator is method-registry based (`--method simple` today), so additional
+The generator is method-registry based (`--method simple|harmonized`), so additional
 offline copy-paste methods can be added without changing the CLI contract.
+`--method harmonized` uses the Libcom PCTNet/LBM model code directly after the
+same copy-paste placement as `simple`, avoiding Libcom's CUDA-only public
+`ImageHarmonizationModel` wrapper. It accepts `--harmonization-model-type
+PCTNet`, `--harmonization-model-type PCNet` (alias for `PCTNet`), or
+`--harmonization-model-type LBM`, plus `--harmonization-device auto|cpu|mps|cuda`.
+LBM also uses `--harmonization-steps` and `--harmonization-resolution`; the
+resolution must be divisible by 8.
+
+```bash
+make premade-coco ARGS="\
+  --source-root data.nosync/raw/coco2017 \
+  --output-root data.nosync/processed/coco2017_harmonized_pct_seed42_sub50 \
+  --method harmonized \
+  --seed 42 \
+  --train-subset-percent 50 \
+  --copy-paste-percent 100 \
+  --harmonization-model-type PCTNet \
+  --harmonization-device auto \
+  --workers 1"
+```
 
 ### Evaluate
 
