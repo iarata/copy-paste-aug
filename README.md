@@ -119,6 +119,13 @@ PCTNet`, `--harmonization-model-type PCNet` (alias for `PCTNet`), or
 `--harmonization-model-type LBM`, plus `--harmonization-device auto|cpu|mps|cuda`.
 LBM also uses `--harmonization-steps` and `--harmonization-resolution`; the
 resolution must be divisible by 8.
+Threaded CUDA/MPS harmonization uses one shared model and serializes model
+inference for reproducibility, so `--max-in-flight > 1` does not run multiple
+GPU forwards with `--parallel-backend thread`.  To use extra VRAM for LBM, run
+separate process workers instead; each process loads its own model copy, so set
+`--workers` to the same value as `--max-in-flight` and increase gradually while
+watching VRAM.  Lowering `--harmonization-steps` gives near-linear speedups, and
+lowering `--harmonization-resolution` reduces compute roughly with image area.
 
 ```bash
 make premade-coco ARGS="\
@@ -131,6 +138,22 @@ make premade-coco ARGS="\
   --harmonization-model-type PCTNet \
   --harmonization-device auto \
   --workers 1"
+```
+
+```bash
+python -m cpa.premade_datasets.coco2017 \
+  --source-root data/raw/coco2017 \
+  --output-root data/processed/coco2017_harmonized_lbm_seed42_sub50 \
+  --method harmonized \
+  --seed 42 \
+  --train-subset-percent 50 \
+  --copy-paste-percent 100 \
+  --harmonization-model-type LBM \
+  --harmonization-device cuda \
+  --parallel-backend process \
+  --workers 2 \
+  --max-in-flight 2 \
+  --resume
 ```
 
 ### Evaluate

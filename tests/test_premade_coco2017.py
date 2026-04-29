@@ -452,6 +452,46 @@ def test_harmonized_accelerator_caps_default_in_flight(tmp_path: Path):
     )
 
 
+def test_harmonized_accelerator_process_backend_uses_spawn(tmp_path: Path):
+    source = tmp_path / "source"
+
+    assert (
+        premade_coco2017._process_start_method(
+            PremadeCocoConfig(
+                source_root=source,
+                output_root=tmp_path / "out_lbm",
+                method="harmonized",
+                harmonization_device="cuda",
+                parallel_backend="process",
+            )
+        )
+        == "spawn"
+    )
+    assert (
+        premade_coco2017._process_start_method(
+            PremadeCocoConfig(
+                source_root=source,
+                output_root=tmp_path / "out_simple",
+                method="simple",
+                parallel_backend="process",
+            )
+        )
+        is None
+    )
+    assert (
+        premade_coco2017._process_start_method(
+            PremadeCocoConfig(
+                source_root=source,
+                output_root=tmp_path / "out_thread",
+                method="harmonized",
+                harmonization_device="cuda",
+                parallel_backend="thread",
+            )
+        )
+        is None
+    )
+
+
 def test_cleanup_removes_original_symlink_aliases_and_keeps_dataset_loadable(tmp_path: Path):
     source = _make_source_coco(tmp_path / "source")
     output = tmp_path / "out"

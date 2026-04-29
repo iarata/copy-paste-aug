@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import math
+import multiprocessing as mp
 import os
 from pathlib import Path
 import shutil
@@ -357,6 +358,7 @@ def build_premade_coco2017(config: PremadeCocoConfig) -> Path:
         config.workers,
         _effective_max_in_flight(config, len(generation_tasks)),
     )
+    _warn_if_threaded_harmonization_is_serialized(config, len(generation_tasks))
 
     generated_records: list[GeneratedImageRecord] = []
     generated_files: list[str] = []
@@ -622,10 +624,9 @@ def _run_generation_tasks(
         ]
         return sorted(results, key=lambda result: result.task_index)
 
-    executor_cls = ThreadPoolExecutor if config.parallel_backend == "thread" else ProcessPoolExecutor
     max_in_flight = _effective_max_in_flight(config, len(tasks))
     results: list[AugmentationResult] = []
-    with executor_cls(max_workers=config.workers) as executor:
+    with _make_generation_executor(config) as executor:
         task_iter = iter(tasks)
         pending: set[Future[AugmentationResult]] = set()
 
@@ -668,6 +669,38 @@ def _run_generation_tasks(
             raise
 
     return sorted(results, key=lambda result: result.task_index)
+
+
+def _make_generation_executor(config: PremadeCocoConfig) -> ThreadPoolExecutor | ProcessPoolExecutor:
+    if config.parallel_backend == "thread":
+        return ThreadPoolExecutor(max_workers=config.workers)
+
+    start_method = _process_start_method(config)
+    if start_method is None:
+        return ProcessPoolExecutor(max_workers=config.workers)
+    return ProcessPoolExecutor(max_workers=config.workers, mp_context=mp.get_context(start_method))
+
+
+def _process_start_method(config: PremadeCocoConfig) -> str | None:
+    if config.parallel_backend != "process":
+        return None
+    if _uses_harmonized_accelerator(config):
+        return "spawn"
+    return None
+
+
+def _warn_if_threaded_harmonization_is_serialized(config: PremadeCocoConfig, task_count: int) -> None:
+    if (
+        task_count > 0
+        and config.parallel_backend == "thread"
+        and _uses_harmonized_accelerator(config)
+        and _effective_max_in_flight(config, task_count) > 1
+    ):
+        logger.warning(
+            "Threaded harmonized GPU/MPS inference uses one shared model and is serialized. "
+            "Use --parallel-backend process with workers=max-in-flight to run multiple model copies, "
+            "or lower --harmonization-steps/--harmonization-resolution for faster single-model runs."
+        )
 
 
 def _effective_max_in_flight(config: PremadeCocoConfig, task_count: int) -> int:
