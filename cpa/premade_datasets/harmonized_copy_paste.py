@@ -23,10 +23,12 @@ except ImportError:  # pragma: no cover - Windows fallback keeps the code import
 import math
 import os
 from pathlib import Path
+import shutil
 import sys
 from threading import Lock
 import types
 from typing import Any
+import zipfile
 
 import cv2
 from diffusers import FlowMatchEulerDiscreteScheduler
@@ -41,6 +43,7 @@ from cpa.utils.dataset_subset import validate_subset_percent
 _MODEL_CACHE: dict[tuple[str, str, torch.dtype], "_BaseHarmonizer"] = {}
 _MODEL_CACHE_LOCK = Lock()
 _MODEL_INFERENCE_LOCK = Lock()
+_LIBCOM_HF_REPO = "BCMIZB/Libcom_pretrained_models"
 
 
 class HarmonizedCopyPasteMethod:
@@ -179,15 +182,14 @@ class _PCTNetHarmonizer(_BaseHarmonizer):
     def __init__(self, device: torch.device) -> None:
         _prepare_libcom_imports()
         from libcom.image_harmonization.source.pct_net import PCTNet
-        from libcom.utils.model_download import download_pretrained_model
 
         self.device = device
         model_root = _libcom_model_root()
         weight_path = model_root / "pretrained_models" / "PCTNet.pth"
         lut_path = model_root / "pretrained_models" / "IdentityLUT33.txt"
         with _download_lock(model_root / "pretrained_models" / ".pctnet_download.lock"):
-            download_pretrained_model(str(weight_path))
-            download_pretrained_model(str(lut_path))
+            _download_pretrained_file(weight_path)
+            _download_pretrained_file(lut_path)
         model = PCTNet()
         model.load_state_dict(_load_torch_state_dict(weight_path))
         self.model = model.to(self.device).eval()
@@ -218,14 +220,13 @@ class _LBMHarmonizer(_BaseHarmonizer):
     def __init__(self, device: torch.device, dtype: torch.dtype) -> None:
         _prepare_libcom_imports()
         from lbm.inference import get_model
-        from libcom.utils.model_download import download_entire_folder
 
         self.device = device
         self.dtype = dtype
         model_root = _libcom_model_root()
         lbm_dir = model_root / "pretrained_models" / "lbm_ckpt"
         with _download_lock(model_root / "pretrained_models" / ".lbm_download.lock"):
-            download_entire_folder(str(lbm_dir))
+            _download_pretrained_folder(lbm_dir)
         self.model = get_model(str(lbm_dir), torch_dtype=dtype, device=str(device))
         self.model.bridge_noise_sigma = 0.005
         if self.model.sampling_noise_scheduler is None:
@@ -313,6 +314,58 @@ def _ensure_namespace_package(module_name: str, path: Path) -> None:
 def _libcom_model_root() -> Path:
     default_root = Path(__file__).resolve().parents[1] / "libcom" / "libcom" / "image_harmonization"
     return Path(os.environ.get("LIBCOM_MODEL_DIR", default_root)).resolve()
+
+
+def _download_pretrained_file(target_path: Path) -> Path:
+    """Download one Libcom checkpoint file with the current Hugging Face Hub API."""
+
+    if target_path.exists():
+        if not target_path.is_file():
+            raise FileExistsError(f"Expected checkpoint file, found directory: {target_path}")
+        return target_path
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    downloaded_path = Path(
+        _hf_hub_download(
+            repo_id=_LIBCOM_HF_REPO,
+            filename=target_path.name,
+            cache_dir=str(target_path.parent),
+        )
+    )
+    if not downloaded_path.exists():
+        raise FileNotFoundError(f"Download failed for {target_path.name}: {downloaded_path}")
+
+    shutil.copyfile(downloaded_path, target_path, follow_symlinks=True)
+    return target_path
+
+
+def _download_pretrained_folder(folder_path: Path) -> Path:
+    """Download and unpack a Libcom checkpoint folder archive."""
+
+    if folder_path.exists():
+        if not folder_path.is_dir():
+            raise FileExistsError(f"Expected checkpoint directory, found file: {folder_path}")
+        if any(folder_path.iterdir()):
+            return folder_path
+        shutil.rmtree(folder_path)
+
+    zip_path = folder_path.with_name(f"{folder_path.name}.zip")
+    _download_pretrained_file(zip_path)
+    with zipfile.ZipFile(zip_path) as archive:
+        archive.extractall(folder_path.parent)
+    zip_path.unlink(missing_ok=True)
+
+    if not folder_path.is_dir() or not any(folder_path.iterdir()):
+        raise FileNotFoundError(f"Downloaded archive did not create checkpoint folder: {folder_path}")
+    return folder_path
+
+
+def _hf_hub_download(**kwargs: Any) -> str:
+    """Small wrapper so tests can patch Hugging Face downloads without network access."""
+
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(**kwargs)
 
 
 @contextmanager

@@ -5,6 +5,7 @@ import importlib
 import json
 from pathlib import Path
 import sys
+import zipfile
 
 import numpy as np
 from PIL import Image
@@ -353,6 +354,61 @@ def test_libcom_premade_imports_do_not_execute_top_level_init(monkeypatch: pytes
     assert getattr(sys.modules["libcom"], "__file__", None) is None
     assert "libcom.shadow_generation" not in sys.modules
     assert "libcom.reflection_generation" not in sys.modules
+
+
+def test_harmonized_checkpoint_download_uses_current_huggingface_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    cached_file = tmp_path / "hf-cache" / "PCTNet.pth"
+    cached_file.parent.mkdir()
+    cached_file.write_bytes(b"checkpoint")
+    calls: list[dict[str, object]] = []
+
+    def fake_hf_hub_download(**kwargs):
+        calls.append(kwargs)
+        return str(cached_file)
+
+    monkeypatch.setattr(harmonized_copy_paste, "_hf_hub_download", fake_hf_hub_download)
+
+    target = tmp_path / "pretrained_models" / "PCTNet.pth"
+    result = harmonized_copy_paste._download_pretrained_file(target)
+
+    assert result == target
+    assert target.read_bytes() == b"checkpoint"
+    assert calls == [
+        {
+            "repo_id": "BCMIZB/Libcom_pretrained_models",
+            "filename": "PCTNet.pth",
+            "cache_dir": str(target.parent),
+        }
+    ]
+    assert "progress" not in calls[0]
+
+
+def test_harmonized_checkpoint_folder_download_extracts_zip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    cached_zip = tmp_path / "hf-cache" / "lbm_ckpt.zip"
+    cached_zip.parent.mkdir()
+    with zipfile.ZipFile(cached_zip, "w") as archive:
+        archive.writestr("lbm_ckpt/config.yaml", "model: test\n")
+        archive.writestr("lbm_ckpt/weights.bin", b"weights")
+
+    def fake_hf_hub_download(**kwargs):
+        assert kwargs["filename"] == "lbm_ckpt.zip"
+        return str(cached_zip)
+
+    monkeypatch.setattr(harmonized_copy_paste, "_hf_hub_download", fake_hf_hub_download)
+
+    folder = tmp_path / "pretrained_models" / "lbm_ckpt"
+    result = harmonized_copy_paste._download_pretrained_folder(folder)
+
+    assert result == folder
+    assert (folder / "config.yaml").read_text(encoding="utf-8") == "model: test\n"
+    assert (folder / "weights.bin").read_bytes() == b"weights"
+    assert not (folder.parent / "lbm_ckpt.zip").exists()
 
 
 def test_harmonized_accelerator_caps_default_in_flight(tmp_path: Path):
