@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -133,6 +134,8 @@ class PremadeCocoConfig:
     parallel_backend: str = "thread"
     show_progress: bool = True
     log_level: str = "INFO"
+    resume: bool = False
+    cleanup_aliases: bool = True
     overwrite: bool = False
     train_images: str = "train2017"
     val_images: str = "val2017"
@@ -253,14 +256,20 @@ def build_premade_coco2017(config: PremadeCocoConfig) -> Path:
     logger.info("source_root={} output_root={}", source_root, output_root)
 
     if output_root.exists():
-        if not config.overwrite:
-            raise FileExistsError(f"{output_root} already exists. Pass --overwrite to replace it.")
-        shutil.rmtree(output_root)
+        if config.overwrite:
+            shutil.rmtree(output_root)
+        elif not config.resume:
+            raise FileExistsError(f"{output_root} already exists. Pass --overwrite or --resume.")
+    if output_root.exists():
+        logger.info("Resuming premade dataset build in {}", output_root)
+    elif config.resume:
+        logger.info("--resume was passed, but {} does not exist; starting a fresh build", output_root)
 
     train_image_out = output_root / config.train_images
     val_image_out = output_root / config.val_images
     annotations_out = output_root / "annotations"
     lists_out = output_root / "lists"
+    resume_out = output_root / ".premade_resume"
     for directory in (train_image_out, val_image_out, annotations_out, lists_out):
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -284,8 +293,9 @@ def build_premade_coco2017(config: PremadeCocoConfig) -> Path:
     )
 
     train_ann_by_image = _annotations_by_image(train_coco)
+    cleanup_original_aliases = config.cleanup_aliases and config.link_mode == "symlink"
 
-    train_original_files = _materialize_original_images(
+    _materialize_original_images(
         images=selected_train_images,
         source_dir=train_image_src,
         output_dir=train_image_out,
@@ -293,7 +303,7 @@ def build_premade_coco2017(config: PremadeCocoConfig) -> Path:
         show_progress=config.show_progress,
         desc="train originals",
     )
-    val_files = _materialize_original_images(
+    _materialize_original_images(
         images=selected_val_images,
         source_dir=val_image_src,
         output_dir=val_image_out,
@@ -301,8 +311,25 @@ def build_premade_coco2017(config: PremadeCocoConfig) -> Path:
         show_progress=config.show_progress,
         desc="val originals",
     )
+    train_original_files = _original_list_entries(
+        selected_train_images,
+        source_dir=train_image_src,
+        use_source_paths=cleanup_original_aliases,
+    )
+    val_files = _original_list_entries(
+        selected_val_images,
+        source_dir=val_image_src,
+        use_source_paths=cleanup_original_aliases,
+    )
 
-    train_images_out = [dict(image) for image in selected_train_images]
+    train_images_out = [
+        _original_image_record_for_output(
+            image,
+            source_dir=train_image_src,
+            use_source_path=cleanup_original_aliases,
+        )
+        for image in selected_train_images
+    ]
     train_annotations_out, next_ann_id = _copy_annotations_for_images(
         train_coco,
         selected_train_images,
@@ -335,6 +362,7 @@ def build_premade_coco2017(config: PremadeCocoConfig) -> Path:
         tasks=generation_tasks,
         source_image_dir=train_image_src,
         output_image_dir=train_image_out,
+        resume_dir=resume_out,
         config=config,
     )
     for result in generation_results:
@@ -346,7 +374,14 @@ def build_premade_coco2017(config: PremadeCocoConfig) -> Path:
             train_annotations_out.append(annotation)
             next_ann_id += 1
 
-    val_images_out = [dict(image) for image in selected_val_images]
+    val_images_out = [
+        _original_image_record_for_output(
+            image,
+            source_dir=val_image_src,
+            use_source_path=cleanup_original_aliases,
+        )
+        for image in selected_val_images
+    ]
     val_annotations_out, _ = _copy_annotations_for_images(
         val_coco,
         selected_val_images,
@@ -368,6 +403,16 @@ def build_premade_coco2017(config: PremadeCocoConfig) -> Path:
         val=val_files,
     )
     _write_dataset_yaml(output_root, train_coco["categories"])
+    cleanup_summary = _cleanup_output_aliases(
+        selected_train_images=selected_train_images,
+        selected_val_images=selected_val_images,
+        train_image_out=train_image_out,
+        val_image_out=val_image_out,
+        train_image_src=train_image_src,
+        val_image_src=val_image_src,
+        enabled=cleanup_original_aliases,
+        show_progress=config.show_progress,
+    )
     _write_manifest(
         output_root,
         config=config,
@@ -375,7 +420,10 @@ def build_premade_coco2017(config: PremadeCocoConfig) -> Path:
         selected_val_images=selected_val_images,
         generated_records=generated_records,
         effective_val_subset_percent=val_subset_percent,
+        cleanup_summary=cleanup_summary,
     )
+    _cleanup_resume_state(resume_out)
+    _cleanup_generation_temps(train_image_out)
     logger.info("Wrote premade COCO dataset to {}", output_root)
     return output_root
 
@@ -458,6 +506,8 @@ def _validate_config(config: PremadeCocoConfig) -> None:
         raise ValueError("workers must be >= 1.")
     if config.parallel_backend not in {"thread", "process"}:
         raise ValueError("parallel_backend must be one of: thread, process.")
+    if config.overwrite and config.resume:
+        raise ValueError("overwrite and resume cannot both be enabled.")
     if config.method == HarmonizedCopyPasteMethod.name:
         normalize_harmonization_model_type(config.harmonization_model_type)
         if config.harmonization_steps < 1:
@@ -550,14 +600,16 @@ def _run_generation_tasks(
     tasks: list[AugmentationTask],
     source_image_dir: Path,
     output_image_dir: Path,
+    resume_dir: Path,
     config: PremadeCocoConfig,
 ) -> list[AugmentationResult]:
     if not tasks:
         return []
 
+    resume_dir.mkdir(parents=True, exist_ok=True)
     if config.workers == 1:
         results = [
-            _generate_augmented_image_task(task, source_image_dir, output_image_dir, config)
+            _generate_augmented_image_task(task, source_image_dir, output_image_dir, resume_dir, config)
             for task in tqdm(
                 tasks,
                 desc="copy-paste images",
@@ -570,7 +622,14 @@ def _run_generation_tasks(
     results: list[AugmentationResult] = []
     with executor_cls(max_workers=config.workers) as executor:
         futures = [
-            executor.submit(_generate_augmented_image_task, task, source_image_dir, output_image_dir, config)
+            executor.submit(
+                _generate_augmented_image_task,
+                task,
+                source_image_dir,
+                output_image_dir,
+                resume_dir,
+                config,
+            )
             for task in tasks
         ]
         for future in tqdm(
@@ -588,9 +647,41 @@ def _generate_augmented_image_task(
     task: AugmentationTask,
     source_image_dir: Path,
     output_image_dir: Path,
+    resume_dir: Path,
     config: PremadeCocoConfig,
 ) -> AugmentationResult:
-    method = METHOD_REGISTRY[config.method]()
+    output_path = output_image_dir / task.file_name
+    if config.resume:
+        resumed = _load_resumed_task_result(
+            task,
+            output_path=output_path,
+            resume_dir=resume_dir,
+            config=config,
+        )
+        if resumed is not None:
+            return resumed
+
+    result = _build_augmented_image_result(
+        task,
+        source_image_dir=source_image_dir,
+        config=config,
+        metadata_only=False,
+    )
+    generated_image = result.pop("generated_image")
+    _atomic_save_image(generated_image, output_path)
+    augmentation_result = result["augmentation_result"]
+    _write_resume_task_result(resume_dir, task, augmentation_result, config=config)
+    return augmentation_result
+
+
+def _build_augmented_image_result(
+    task: AugmentationTask,
+    *,
+    source_image_dir: Path,
+    config: PremadeCocoConfig,
+    metadata_only: bool,
+) -> dict[str, Any]:
+    method = _method_for_task(config, metadata_only=metadata_only)
     rng = np.random.default_rng(task.rng_seed)
     base_sample = _load_sample_from_annotations(source_image_dir, task.base_image, task.base_annotations)
     paste_sample = _load_sample_from_annotations(source_image_dir, task.paste_image, task.paste_annotations)
@@ -602,7 +693,6 @@ def _generate_augmented_image_task(
         config=config,
     )
 
-    Image.fromarray(generated_image).save(output_image_dir / task.file_name, quality=95)
     height, width = generated_image.shape[:2]
     annotations: list[dict[str, Any]] = []
     for instance in generated_instances:
@@ -628,13 +718,144 @@ def _generate_augmented_image_task(
         paste_image_id=int(task.paste_image["id"]),
         paste_annotation_ids=paste_annotation_ids,
     )
-    return AugmentationResult(
+    augmentation_result = AugmentationResult(
         task_index=task.task_index,
         image_record=image_record,
         annotations=annotations,
         generated_record=generated_record,
         file_name=task.file_name,
     )
+    return {"generated_image": generated_image, "augmentation_result": augmentation_result}
+
+
+def _method_for_task(config: PremadeCocoConfig, *, metadata_only: bool) -> CopyPasteMethod:
+    if metadata_only and config.method == HarmonizedCopyPasteMethod.name:
+        return SimpleCopyPasteMethod()
+    return METHOD_REGISTRY[config.method]()
+
+
+def _load_resumed_task_result(
+    task: AugmentationTask,
+    *,
+    output_path: Path,
+    resume_dir: Path,
+    config: PremadeCocoConfig,
+) -> AugmentationResult | None:
+    if not _is_reusable_image(output_path):
+        return None
+
+    sidecar = _resume_task_path(resume_dir, task)
+    if not sidecar.exists():
+        return None
+    try:
+        payload = _read_json(sidecar)
+        task_payload = payload.get("task", {})
+        if task_payload != _task_resume_payload(task):
+            return None
+        if payload.get("config") != _resume_config_payload(config):
+            return None
+        generated_record = GeneratedImageRecord(**payload["generated_record"])
+        return AugmentationResult(
+            task_index=int(payload["task_index"]),
+            image_record=payload["image_record"],
+            annotations=payload["annotations"],
+            generated_record=generated_record,
+            file_name=str(payload["file_name"]),
+        )
+    except Exception as exc:
+        logger.warning("Ignoring invalid resume sidecar {}: {}", sidecar, exc)
+        return None
+
+
+def _write_resume_task_result(
+    resume_dir: Path,
+    task: AugmentationTask,
+    result: AugmentationResult,
+    *,
+    config: PremadeCocoConfig,
+) -> None:
+    payload = {
+        "config": _resume_config_payload(config),
+        "task": _task_resume_payload(task),
+        "task_index": result.task_index,
+        "image_record": result.image_record,
+        "annotations": result.annotations,
+        "generated_record": asdict(result.generated_record),
+        "file_name": result.file_name,
+    }
+    _atomic_write_json(_resume_task_path(resume_dir, task), payload)
+
+
+def _task_resume_payload(task: AugmentationTask) -> dict[str, Any]:
+    return {
+        "task_index": task.task_index,
+        "image_id": task.image_id,
+        "file_name": task.file_name,
+        "base_image_id": int(task.base_image["id"]),
+        "paste_image_id": int(task.paste_image["id"]),
+        "rng_seed": task.rng_seed,
+    }
+
+
+def _resume_config_payload(config: PremadeCocoConfig) -> dict[str, Any]:
+    keys = (
+        "source_root",
+        "method",
+        "seed",
+        "train_subset_percent",
+        "copy_paste_percent",
+        "augmented_per_image",
+        "objects_paste_percent",
+        "max_paste_objects",
+        "scale_min",
+        "scale_max",
+        "flip_prob",
+        "blend",
+        "sigma",
+        "harmonization_model_type",
+        "harmonization_device",
+        "harmonization_steps",
+        "harmonization_resolution",
+        "train_images",
+        "train_json",
+    )
+    payload = {key: getattr(config, key) for key in keys}
+    payload["source_root"] = str(Path(payload["source_root"]).resolve())
+    return payload
+
+
+def _resume_task_path(resume_dir: Path, task: AugmentationTask) -> Path:
+    stem = Path(task.file_name).stem
+    return resume_dir / "tasks" / f"{task.task_index:08d}_{stem}.json"
+
+
+def _is_reusable_image(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size <= 0:
+        return False
+    try:
+        with Image.open(path) as image:
+            image.verify()
+    except Exception:
+        return False
+    return True
+
+
+def _atomic_save_image(image: np.ndarray, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = output_path.with_name(f".{output_path.stem}.tmp-{os.getpid()}{output_path.suffix}")
+    try:
+        Image.fromarray(image).save(tmp_path, format="JPEG", quality=95)
+        tmp_path.replace(output_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def _load_sample_from_annotations(
@@ -697,6 +918,21 @@ def _materialize_original_images(
         source = source_dir / file_name
         destination = output_dir / file_name
         destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists() or destination.is_symlink():
+            if (
+                link_mode == "symlink"
+                and destination.is_symlink()
+                and destination.resolve() == source.resolve()
+            ):
+                files.append(file_name)
+                continue
+            if link_mode == "copy" and destination.is_file():
+                files.append(file_name)
+                continue
+            if link_mode == "hardlink" and destination.is_file():
+                files.append(file_name)
+                continue
+            destination.unlink()
         if link_mode == "copy":
             shutil.copy2(source, destination)
         elif link_mode == "hardlink":
@@ -705,6 +941,101 @@ def _materialize_original_images(
             destination.symlink_to(source.resolve())
         files.append(file_name)
     return files
+
+
+def _original_image_record_for_output(
+    image: dict[str, Any],
+    *,
+    source_dir: Path,
+    use_source_path: bool,
+) -> dict[str, Any]:
+    record = dict(image)
+    if use_source_path:
+        record["file_name"] = str((source_dir / image["file_name"]).resolve())
+    return record
+
+
+def _original_list_entries(
+    images: list[dict[str, Any]],
+    *,
+    source_dir: Path,
+    use_source_paths: bool,
+) -> list[str]:
+    if use_source_paths:
+        return [str((source_dir / image["file_name"]).resolve()) for image in images]
+    return [str(image["file_name"]) for image in images]
+
+
+def _cleanup_output_aliases(
+    *,
+    selected_train_images: list[dict[str, Any]],
+    selected_val_images: list[dict[str, Any]],
+    train_image_out: Path,
+    val_image_out: Path,
+    train_image_src: Path,
+    val_image_src: Path,
+    enabled: bool,
+    show_progress: bool,
+) -> dict[str, Any]:
+    if not enabled:
+        return {"enabled": False, "removed_train_aliases": 0, "removed_val_aliases": 0}
+
+    removed_train = _cleanup_original_aliases(
+        selected_train_images,
+        output_dir=train_image_out,
+        source_dir=train_image_src,
+        show_progress=show_progress,
+        desc="cleanup train aliases",
+    )
+    removed_val = _cleanup_original_aliases(
+        selected_val_images,
+        output_dir=val_image_out,
+        source_dir=val_image_src,
+        show_progress=show_progress,
+        desc="cleanup val aliases",
+    )
+    return {
+        "enabled": True,
+        "removed_train_aliases": removed_train,
+        "removed_val_aliases": removed_val,
+    }
+
+
+def _cleanup_original_aliases(
+    images: list[dict[str, Any]],
+    *,
+    output_dir: Path,
+    source_dir: Path,
+    show_progress: bool,
+    desc: str,
+) -> int:
+    removed = 0
+    for image in tqdm(images, desc=desc, disable=not show_progress):
+        alias_path = output_dir / image["file_name"]
+        if not alias_path.is_symlink():
+            continue
+        expected_target = (source_dir / image["file_name"]).resolve()
+        if alias_path.resolve() != expected_target:
+            logger.warning(
+                "Skipping cleanup for unexpected symlink {} -> {}", alias_path, alias_path.resolve()
+            )
+            continue
+        alias_path.unlink()
+        removed += 1
+    return removed
+
+
+def _cleanup_resume_state(resume_dir: Path) -> None:
+    if resume_dir.exists():
+        shutil.rmtree(resume_dir)
+
+
+def _cleanup_generation_temps(image_dir: Path) -> None:
+    if not image_dir.exists():
+        return
+    for tmp_path in image_dir.glob(".*.tmp-*"):
+        if tmp_path.is_file() or tmp_path.is_symlink():
+            tmp_path.unlink()
 
 
 def _copy_annotations_for_images(
@@ -976,6 +1307,7 @@ def _write_manifest(
     selected_val_images: list[dict[str, Any]],
     generated_records: list[GeneratedImageRecord],
     effective_val_subset_percent: float,
+    cleanup_summary: dict[str, Any],
 ) -> None:
     config_payload = asdict(config)
     for key in ("source_root", "output_root"):
@@ -986,6 +1318,7 @@ def _write_manifest(
         "selected_train_image_ids": [image["id"] for image in selected_train_images],
         "selected_val_image_ids": [image["id"] for image in selected_val_images],
         "generated_images": [asdict(record) for record in generated_records],
+        "cleanup": cleanup_summary,
         "list_files": {
             "train_original": "lists/train_original.txt",
             "train_augmented": "lists/train_augmented.txt",
@@ -1043,6 +1376,15 @@ def parse_args(argv: list[str] | None = None) -> PremadeCocoConfig:
     parser.add_argument("--parallel-backend", choices=("thread", "process"), default="thread")
     parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument(
+        "--resume", action="store_true", help="Reuse completed augmented images in output-root."
+    )
+    parser.add_argument(
+        "--cleanup-aliases",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Remove generated original-image symlink aliases from the output tree after a successful build.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = vars(parser.parse_args(argv))
     args["show_progress"] = args.pop("progress")

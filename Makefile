@@ -71,6 +71,20 @@ endif
 	curl -L -o $(OUTPUT) \
 		https://www.kaggle.com/api/v1/datasets/download/awsaf49/coco-2017-dataset
 
+.PHONY: download-coco-aria2
+download-coco-aria2:
+ifeq ($(OUTPUT),)
+	$(error OUTPUT is required. Usage: make download-coco OUTPUT=/path/to/file.zip)
+endif
+	aria2c \
+		--max-connection-per-server=16 \
+		--split=16 \
+		--min-split-size=1M \
+		--continue \
+		--console-log-level=error \
+		-o $(OUTPUT) \
+		https://www.kaggle.com/api/v1/datasets/download/awsaf49/coco-2017-dataset
+
 
 ## Run evaluation
 .PHONY: eval

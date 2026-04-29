@@ -267,6 +267,65 @@ def test_harmonized_method_preserves_simple_randomness_with_identity_model(
     assert calls[0][1] == 255
 
 
+def test_resume_reuses_completed_harmonized_tasks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source = _make_source_coco(tmp_path / "source")
+    output = tmp_path / "resume"
+
+    class FailingHarmonizer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, composite_image: np.ndarray, composite_mask: np.ndarray, **kwargs):
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("stop after one completed task")
+            return composite_image
+
+    failing = FailingHarmonizer()
+    monkeypatch.setattr(harmonized_copy_paste, "_get_harmonization_model", lambda config: failing)
+    common = {
+        "source_root": source,
+        "output_root": output,
+        "method": "harmonized",
+        "seed": 31,
+        "train_subset_percent": 50.0,
+        "copy_paste_percent": 100.0,
+        "objects_paste_percent": 100.0,
+        "scale_min": 1.0,
+        "scale_max": 1.0,
+        "flip_prob": 0.0,
+        "blend": False,
+        "link_mode": "copy",
+        "workers": 1,
+        "show_progress": False,
+    }
+
+    with pytest.raises(RuntimeError, match="stop after one completed task"):
+        build_premade_coco2017(PremadeCocoConfig(**common))
+    assert (output / ".premade_resume" / "tasks").exists()
+
+    resumed_calls = 0
+
+    class IdentityHarmonizer:
+        def __call__(self, composite_image: np.ndarray, composite_mask: np.ndarray, **kwargs):
+            nonlocal resumed_calls
+            resumed_calls += 1
+            return composite_image
+
+    monkeypatch.setattr(
+        harmonized_copy_paste, "_get_harmonization_model", lambda config: IdentityHarmonizer()
+    )
+    build_premade_coco2017(PremadeCocoConfig(resume=True, **common))
+
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert len(manifest["generated_images"]) > 1
+    assert resumed_calls == len(manifest["generated_images"]) - 1
+    assert not (output / ".premade_resume").exists()
+
+
 def test_harmonized_device_and_dtype_helpers(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
@@ -293,6 +352,53 @@ def test_libcom_premade_imports_do_not_execute_top_level_init(monkeypatch: pytes
     assert getattr(sys.modules["libcom"], "__file__", None) is None
     assert "libcom.shadow_generation" not in sys.modules
     assert "libcom.reflection_generation" not in sys.modules
+
+
+def test_cleanup_removes_original_symlink_aliases_and_keeps_dataset_loadable(tmp_path: Path):
+    source = _make_source_coco(tmp_path / "source")
+    output = tmp_path / "out"
+
+    build_premade_coco2017(
+        PremadeCocoConfig(
+            source_root=source,
+            output_root=output,
+            method="simple",
+            seed=17,
+            train_subset_percent=50.0,
+            copy_paste_percent=50.0,
+            objects_paste_percent=100.0,
+            scale_min=1.0,
+            scale_max=1.0,
+            flip_prob=0.0,
+            blend=False,
+            link_mode="symlink",
+            show_progress=False,
+        )
+    )
+
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    train_json = json.loads((output / "annotations" / "instances_train2017.json").read_text(encoding="utf-8"))
+    source_train = json.loads(
+        (source / "annotations" / "instances_train2017.json").read_text(encoding="utf-8")
+    )
+    source_image_by_id = {image["id"]: image for image in source_train["images"]}
+
+    for image_id in manifest["selected_train_image_ids"]:
+        source_file = source_image_by_id[image_id]["file_name"]
+        assert not (output / "train2017" / source_file).exists()
+
+    original_records = [
+        image for image in train_json["images"] if image["id"] in set(manifest["selected_train_image_ids"])
+    ]
+    assert original_records
+    for image in original_records:
+        image_path = Path(image["file_name"])
+        assert image_path.is_absolute()
+        assert image_path.exists()
+
+    for record in manifest["generated_images"]:
+        assert (output / "train2017" / record["file_name"]).exists()
+    assert manifest["cleanup"]["removed_train_aliases"] == len(manifest["selected_train_image_ids"])
 
 
 def test_parallel_backends_match_single_worker_output(tmp_path: Path):
