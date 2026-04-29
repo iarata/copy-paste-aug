@@ -55,7 +55,7 @@ dependencies = [
     "ultralytics>=8.4.41",
     "wandb>=0.26.0",
 ]
-requires-python = "~=3.13.0"
+requires-python = "~=3.11.0"
 
 
 [tool.ruff]
@@ -69,3 +69,6 @@ extend-select = ["I"]  # Add import sorting
 [tool.ruff.lint.isort]
 known-first-party = ["cpa"]
 force-sort-within-sections = true
+
+[tool.uv.extra-build-dependencies]
+xtcocotools = ["numpy"]

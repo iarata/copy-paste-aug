@@ -63,6 +63,47 @@ Copy-paste experiment options:
 - `dataset.augmentations.name=ultralytics_mixup`
 - `dataset.augmentations.name=cpa`
 
+## Premade COCO Copy-Paste Datasets
+
+Offline copy-paste datasets are generated under a separate output root, so the
+original COCO2017 folder is never modified.  The default selector builds a
+category-balanced train and validation subset: each class keeps at least the
+requested percentage of images containing that class.  If
+`--val-subset-percent` is omitted, it defaults to `--train-subset-percent`.
+
+```bash
+make premade-coco ARGS="\
+  --source-root data.nosync/raw/coco2017 \
+  --output-root data.nosync/processed/coco2017_simple_cp_seed42_sub50 \
+  --method simple \
+  --seed 42 \
+  --train-subset-percent 50 \
+  --copy-paste-percent 100 \
+  --workers 8 \
+  --parallel-backend process"
+```
+
+The output contains COCO JSON files, a `coco_data.yaml`, a `manifest.json`, and
+list files under `lists/` for original, augmented, and combined train images.
+Use `--parallel-backend thread` for thread workers, `--parallel-backend process`
+for multiprocessing, and `--no-progress` to disable tqdm progress bars.  Loguru
+logging is enabled by the CLI and can be controlled with `--log-level`.
+To train on the premade dataset, point the dataset config at the generated root
+and disable online augmentation:
+
+```bash
+make train ARGS="\
+  dataset.root=data.nosync/processed/coco2017_simple_cp_seed42_sub50 \
+  dataset.train_json=annotations/instances_train2017.json \
+  dataset.val_json=annotations/instances_val2017.json \
+  dataset.train_images=train2017 \
+  dataset.val_images=val2017 \
+  dataset.augmentations.name=none"
+```
+
+The generator is method-registry based (`--method simple` today), so additional
+offline copy-paste methods can be added without changing the CLI contract.
+
 ### Evaluate
 
 ```bash

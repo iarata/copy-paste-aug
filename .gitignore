@@ -9,6 +9,8 @@ data.nosync
 *.pth
 # Mac OS-specific storage files
 .DS_Store
+Copy-Paste_Augmentation
+copy_paste_agathe
 
 # vim
 *.swp

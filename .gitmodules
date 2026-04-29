@@ -1,0 +1,3 @@
+[submodule "cpa/libcom"]
+	path = cpa/libcom
+	url = https://github.com/bcmi/libcom

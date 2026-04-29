@@ -3,7 +3,7 @@
 #################################################################################
 
 PROJECT_NAME = copy-paste-aug
-PYTHON_VERSION = 3.13
+PYTHON_VERSION = 3.11
 PYTHON_INTERPRETER = python
 
 #################################################################################
@@ -76,6 +76,11 @@ endif
 .PHONY: eval
 eval:
 	uv run python -m cpa.training training.mode=eval $(ARGS)
+
+## Generate a premade COCO2017 copy-paste dataset
+.PHONY: premade-coco
+premade-coco:
+	uv run python -m cpa.premade_datasets.coco2017 $(ARGS)
 
 ## Generate config dataclasses from YAML configs
 .PHONY: gen-configs
