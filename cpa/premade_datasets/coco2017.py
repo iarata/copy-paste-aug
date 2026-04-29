@@ -35,11 +35,16 @@ from pycocotools import mask as mask_utils
 from tqdm.auto import tqdm
 import yaml
 
-from cpa.augs.copy_paste import image_copy_paste
+# PCTNet can native-crash on macOS if Albumentations/skimage initialize before torch.
+# Keep the harmonized import before cpa.augs.copy_paste.
+# isort: off
 from cpa.premade_datasets.harmonized_copy_paste import (
     HarmonizedCopyPasteMethod,
     normalize_harmonization_model_type,
 )
+from cpa.augs.copy_paste import image_copy_paste
+
+# isort: on
 from cpa.utils.dataset_subset import subset_indices, validate_subset_percent
 
 logger.disable(__name__)

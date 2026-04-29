@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 import sys
 from threading import Lock
+import types
 from typing import Any
 
 import cv2
@@ -278,9 +279,35 @@ def _prepare_libcom_imports() -> None:
     if str(libcom_root) not in sys.path:
         sys.path.insert(0, str(libcom_root))
 
+    libcom_pkg = libcom_root / "libcom"
+    _ensure_namespace_package("libcom", libcom_pkg)
+    _ensure_namespace_package("libcom.image_harmonization", libcom_pkg / "image_harmonization")
+    _ensure_namespace_package(
+        "libcom.image_harmonization.source",
+        libcom_pkg / "image_harmonization" / "source",
+    )
+    _ensure_namespace_package("libcom.utils", libcom_pkg / "utils")
+
     lbm_src = libcom_root / "libcom" / "image_harmonization" / "source" / "src"
     if str(lbm_src) not in sys.path:
         sys.path.insert(0, str(lbm_src))
+
+
+def _ensure_namespace_package(module_name: str, path: Path) -> None:
+    """Expose Libcom subpackages without executing Libcom's broad top-level imports."""
+
+    path_str = str(path)
+    module = sys.modules.get(module_name)
+    if module is None:
+        module = types.ModuleType(module_name)
+        module.__path__ = [path_str]
+        module.__package__ = module_name
+        sys.modules[module_name] = module
+        return
+
+    module_paths = getattr(module, "__path__", None)
+    if module_paths is not None and path_str not in module_paths:
+        module_paths.append(path_str)
 
 
 def _libcom_model_root() -> Path:

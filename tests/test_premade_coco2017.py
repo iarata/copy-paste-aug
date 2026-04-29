@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
 from PIL import Image
@@ -277,6 +279,20 @@ def test_harmonized_device_and_dtype_helpers(monkeypatch: pytest.MonkeyPatch):
     assert harmonized_copy_paste._resolve_dtype("LBM", torch.device("mps")) == torch.float32
     assert harmonized_copy_paste._resolve_dtype("LBM", torch.device("cuda:0")) == torch.bfloat16
     assert harmonized_copy_paste.normalize_harmonization_model_type("PCNet") == "PCTNet"
+
+
+def test_libcom_premade_imports_do_not_execute_top_level_init(monkeypatch: pytest.MonkeyPatch):
+    for module_name in list(sys.modules):
+        if module_name == "libcom" or module_name.startswith("libcom."):
+            monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    harmonized_copy_paste._prepare_libcom_imports()
+    pct_module = importlib.import_module("libcom.image_harmonization.source.pct_net")
+
+    assert hasattr(pct_module, "PCTNet")
+    assert getattr(sys.modules["libcom"], "__file__", None) is None
+    assert "libcom.shadow_generation" not in sys.modules
+    assert "libcom.reflection_generation" not in sys.modules
 
 
 def test_parallel_backends_match_single_worker_output(tmp_path: Path):
