@@ -16,6 +16,7 @@ from cpa.tinyrfdeter.data import CocoPremadeDataModule, denormalize_image
 from cpa.tinyrfdeter.model import (
     TinyRFDETRSegCriterion,
     Variant,
+    box_cxcywh_to_xyxy,
     build_tinyrfdetrseg,
     config_for_variant,
 )
@@ -49,6 +50,7 @@ class TinyRFDETRSegLightning(L.LightningModule):
         log_images_every_n_epochs: int = 1,
         max_log_images: int = 4,
         max_log_instances: int = 20,
+        map_top_k: int = 100,
         return_aux: bool = False,
     ) -> None:
         super().__init__()
@@ -61,6 +63,17 @@ class TinyRFDETRSegLightning(L.LightningModule):
             return_aux=return_aux,
         )
         self.criterion = TinyRFDETRSegCriterion(num_classes=num_classes)
+        try:
+            from torchmetrics.detection.mean_ap import MeanAveragePrecision
+        except ImportError as exc:
+            raise ImportError("torchmetrics is required for validation mAP logging.") from exc
+
+        self.map_metric = MeanAveragePrecision(
+            box_format="xyxy",
+            iou_type=("bbox", "segm"),
+            max_detection_thresholds=[1, 10, 100],
+            class_metrics=False,
+        )
 
     def forward(self, images: Tensor) -> dict[str, Any]:
         return self.model(images)
@@ -93,6 +106,10 @@ class TinyRFDETRSegLightning(L.LightningModule):
             batch_size=images.shape[0],
         )
         self.log_dict(metrics, on_epoch=True, batch_size=images.shape[0])
+        self.map_metric.update(
+            self._map_predictions(outputs, image_size=images.shape[-2:]),
+            self._map_targets(targets, image_size=images.shape[-2:]),
+        )
         self._log_wandb_images(batch_idx, images, targets, outputs)
         return loss
 
@@ -171,6 +188,67 @@ class TinyRFDETRSegLightning(L.LightningModule):
             "val/mask_f1_50": f1,
             "val/predictions_per_image": prediction_count / max(len(targets), 1),
         }
+
+    def on_validation_epoch_end(self) -> None:
+        metrics = self.map_metric.compute()
+        self.map_metric.reset()
+        keys = {
+            "map": "val/mAP50-95_box",
+            "map_50": "val/mAP50_box",
+            "map_75": "val/mAP75_box",
+            "segm_map": "val/mAP50-95_mask",
+            "segm_map_50": "val/mAP50_mask",
+            "segm_map_75": "val/mAP75_mask",
+        }
+        for source, target in keys.items():
+            value = metrics.get(source)
+            if value is not None:
+                self.log(target, value, prog_bar=source in {"segm_map", "segm_map_50"}, sync_dist=True)
+
+    @torch.no_grad()
+    def _map_predictions(
+        self, outputs: dict[str, Tensor], *, image_size: tuple[int, int]
+    ) -> list[dict[str, Tensor]]:
+        logits = outputs["pred_logits"]
+        boxes = self._normalized_boxes_to_pixels(outputs["pred_boxes"], image_size)
+        masks = (
+            F.interpolate(outputs["pred_masks"], size=image_size, mode="bilinear", align_corners=False) > 0
+        )
+        batch_size, _, num_classes = logits.shape
+        top_k = min(int(self.hparams.map_top_k), logits.shape[1] * num_classes)
+        scores, indexes = logits.sigmoid().flatten(1).topk(top_k, dim=1)
+
+        predictions = []
+        for batch_index in range(batch_size):
+            query_idx = indexes[batch_index] // num_classes
+            labels = indexes[batch_index] % num_classes
+            predictions.append(
+                {
+                    "boxes": boxes[batch_index, query_idx],
+                    "scores": scores[batch_index],
+                    "labels": labels,
+                    "masks": masks[batch_index, query_idx],
+                }
+            )
+        return predictions
+
+    @torch.no_grad()
+    def _map_targets(
+        self, targets: list[dict[str, Tensor]], *, image_size: tuple[int, int]
+    ) -> list[dict[str, Tensor]]:
+        return [
+            {
+                "boxes": self._normalized_boxes_to_pixels(target["boxes"].unsqueeze(0), image_size)[0],
+                "labels": target["labels"],
+                "masks": target["masks"].bool(),
+            }
+            for target in targets
+        ]
+
+    def _normalized_boxes_to_pixels(self, boxes: Tensor, image_size: tuple[int, int]) -> Tensor:
+        height, width = image_size
+        scale = boxes.new_tensor([width, height, width, height])
+        return box_cxcywh_to_xyxy(boxes).clamp(0, 1) * scale
 
     @torch.no_grad()
     def _log_wandb_images(
@@ -252,6 +330,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-root", type=Path, default=Path("data.nosync/processed/coco2017_simple_cp_seed42_sub50")
     )
+    parser.add_argument(
+        "--val-data-root",
+        type=Path,
+        default=None,
+        help="Original COCO root for validation. Auto-detects a sibling coco2017 directory when omitted.",
+    )
+    parser.add_argument(
+        "--train-image-set",
+        choices=["augmented", "original", "all"],
+        default="augmented",
+        help="Which premade train list to use from data-root/lists. Defaults to augmented-only.",
+    )
     parser.add_argument("--variant", choices=["n", "s", "m"], default="n")
     parser.add_argument("--image-size", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -267,6 +357,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-project", default="copy-paste-aug")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--score-threshold", type=float, default=0.25)
+    parser.add_argument("--map-top-k", type=int, default=100)
     parser.add_argument("--log-images-every-n-epochs", type=int, default=1)
     parser.add_argument("--accelerator", default="auto")
     parser.add_argument("--devices", default="auto")
@@ -285,21 +376,51 @@ def _trainer_devices(value: str) -> str | int:
     return int(value) if value.isdigit() else value
 
 
+def _has_coco_val(root: Path) -> bool:
+    return (root / "annotations" / "instances_val2017.json").exists() and (root / "val2017").exists()
+
+
+def resolve_val_root(train_root: Path, explicit_val_root: Path | None) -> Path:
+    if explicit_val_root is not None:
+        return explicit_val_root
+
+    candidates = [
+        train_root.parent / "coco2017",
+        train_root.parent.parent / "raw" / "coco2017",
+        train_root,
+    ]
+    for candidate in candidates:
+        if _has_coco_val(candidate):
+            return candidate
+    return train_root
+
+
 def main() -> None:
     args = parse_args()
     L.seed_everything(args.seed, workers=True)
+    torch.set_float32_matmul_precision("high")
 
     cfg = config_for_variant(args.variant, image_size=args.image_size)
+    val_root = resolve_val_root(args.data_root, args.val_data_root)
     dm = CocoPremadeDataModule(
-        args.data_root,
+        train_root=args.data_root,
+        val_root=val_root,
         image_size=cfg.image_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        train_image_set=args.train_image_set,
         train_subset_percent=args.train_subset_percent,
         val_subset_percent=args.val_subset_percent,
         seed=args.seed,
     )
     dm.setup("fit")
+    train_count = len(dm.train_dataset) if dm.train_dataset is not None else 0
+    val_count = len(dm.val_dataset) if dm.val_dataset is not None else 0
+    print(
+        "TinyRFDETR data: "
+        f"train_root={dm.train_root} train_image_set={args.train_image_set} train_images={train_count} "
+        f"val_root={dm.val_root} val_images={val_count}"
+    )
 
     model = TinyRFDETRSegLightning(
         variant=args.variant,
@@ -310,6 +431,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
         score_threshold=args.score_threshold,
         log_images_every_n_epochs=args.log_images_every_n_epochs,
+        map_top_k=args.map_top_k,
     )
 
     logger = None

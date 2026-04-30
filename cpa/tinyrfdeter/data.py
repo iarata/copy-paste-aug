@@ -20,7 +20,8 @@ import lightning as L
 
 IMAGENET_MEAN: tuple[float, float, float] = (0.485, 0.456, 0.406)
 IMAGENET_STD: tuple[float, float, float] = (0.229, 0.224, 0.225)
-Split = Literal["train", "val"]
+Split = Literal["train", "val", "test"]
+TrainImageSet = Literal["augmented", "original", "all"]
 
 
 def build_transforms(image_size: int, *, train: bool) -> A.Compose:
@@ -47,12 +48,37 @@ def subset_sequence(items: Sequence[Any], percent: float, seed: int) -> list[Any
     if percent <= 0 or percent > 100:
         raise ValueError("subset percent must be in (0, 100]")
     items = list(items)
+    if not items:
+        return []
     if percent >= 100:
         return items
     count = max(1, round(len(items) * percent / 100.0))
     rng = random.Random(seed)
     selected = sorted(rng.sample(range(len(items)), count))
     return [items[index] for index in selected]
+
+
+def read_image_list(path: Path | None) -> set[str] | None:
+    if path is None:
+        return None
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Expected image list at {path}. Use --train-image-set all to train on every train image."
+        )
+    names = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        value = line.strip()
+        if value:
+            names.add(value)
+            names.add(Path(value).name)
+    return names
+
+
+def image_matches_list(image: dict[str, Any], allowed_names: set[str] | None) -> bool:
+    if allowed_names is None:
+        return True
+    file_name = str(image["file_name"])
+    return file_name in allowed_names or Path(file_name).name in allowed_names
 
 
 def decode_coco_mask(segmentation: Any, height: int, width: int) -> np.ndarray:
@@ -144,7 +170,8 @@ def resolve_image_path(image_dir: Path, file_name: str) -> Path:
     raise FileNotFoundError(
         "Could not find image for COCO record "
         f"{file_name!r}. Tried:\n{tried}\n"
-        "If this is a premade dataset copied without raw COCO2017, regenerate it with "
+        "If this came from validation, pass --val-data-root pointing at the original COCO2017 root. "
+        "If this came from a premade train split copied without raw COCO2017, regenerate it with "
         "--no-cleanup-aliases or copy the raw images referenced by the annotation JSON."
     )
 
@@ -159,6 +186,7 @@ class CocoPremadeInstanceSegDataset(Dataset):
         train: bool,
         subset_percent: float = 100.0,
         subset_seed: int = 0,
+        image_list: str | Path | None = None,
     ) -> None:
         super().__init__()
         self.root = Path(root)
@@ -174,7 +202,11 @@ class CocoPremadeInstanceSegDataset(Dataset):
         categories = sorted(coco["categories"], key=lambda category: category["id"])
         self.class_names = [category["name"] for category in categories]
         self.category_to_label = {category["id"]: index for index, category in enumerate(categories)}
-        images = subset_sequence(coco["images"], subset_percent, subset_seed)
+        allowed_names = read_image_list(Path(image_list) if image_list is not None else None)
+        images = [image for image in coco["images"] if image_matches_list(image, allowed_names)]
+        images = subset_sequence(images, subset_percent, subset_seed)
+        if not images:
+            raise ValueError(f"No {split} images found in {self.root} after applying subset/list filters.")
         self.images = {image["id"]: image for image in images}
 
         annotations_by_image = {image_id: [] for image_id in self.images}
@@ -259,11 +291,13 @@ def collate_instances(
 class CocoPremadeDataModule(L.LightningDataModule):
     def __init__(
         self,
-        root: str | Path,
+        train_root: str | Path,
         *,
+        val_root: str | Path,
         image_size: int,
         batch_size: int,
         num_workers: int,
+        train_image_set: TrainImageSet = "augmented",
         train_subset_percent: float = 100.0,
         val_subset_percent: float = 100.0,
         seed: int = 0,
@@ -271,10 +305,12 @@ class CocoPremadeDataModule(L.LightningDataModule):
         persistent_workers: bool = True,
     ) -> None:
         super().__init__()
-        self.root = Path(root)
+        self.train_root = Path(train_root)
+        self.val_root = Path(val_root)
         self.image_size = int(image_size)
         self.batch_size = int(batch_size)
         self.num_workers = int(num_workers)
+        self.train_image_set = train_image_set
         self.train_subset_percent = float(train_subset_percent)
         self.val_subset_percent = float(val_subset_percent)
         self.seed = int(seed)
@@ -297,22 +333,28 @@ class CocoPremadeDataModule(L.LightningDataModule):
     def setup(self, stage: str | None = None) -> None:
         if stage in {None, "fit"} and self.train_dataset is None:
             self.train_dataset = CocoPremadeInstanceSegDataset(
-                self.root,
+                self.train_root,
                 split="train",
                 image_size=self.image_size,
                 train=True,
                 subset_percent=self.train_subset_percent,
                 subset_seed=self.seed,
+                image_list=self._train_image_list(),
             )
         if stage in {None, "fit", "validate"} and self.val_dataset is None:
             self.val_dataset = CocoPremadeInstanceSegDataset(
-                self.root,
+                self.val_root,
                 split="val",
                 image_size=self.image_size,
                 train=False,
                 subset_percent=self.val_subset_percent,
                 subset_seed=self.seed,
             )
+
+    def _train_image_list(self) -> Path | None:
+        if self.train_image_set == "all":
+            return None
+        return self.train_root / "lists" / f"train_{self.train_image_set}.txt"
 
     def train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:

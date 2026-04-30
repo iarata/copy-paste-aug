@@ -64,7 +64,9 @@ train:
 	uv run python -m cpa.training $(ARGS)
 
 TINYRFD_DATA ?= data.nosync/processed/coco2017_simple_cp_seed42_sub50
+TINYRFD_VAL_DATA ?=
 TINYRFD_VARIANT ?= n
+TINYRFD_TRAIN_IMAGE_SET ?= augmented
 TINYRFD_ARGS ?=
 WANDB_MODE ?= offline
 
@@ -72,7 +74,8 @@ WANDB_MODE ?= offline
 .PHONY: tinyrfdeter-train
 tinyrfdeter-train:
 	WANDB_MODE=$(WANDB_MODE) uv run python -m cpa.tinyrfdeter.lightning \
-		--data-root $(TINYRFD_DATA) \
+		--data-root $(TINYRFD_DATA) $(if $(TINYRFD_VAL_DATA),--val-data-root $(TINYRFD_VAL_DATA),) \
+		--train-image-set $(TINYRFD_TRAIN_IMAGE_SET) \
 		--variant $(TINYRFD_VARIANT) \
 		--wandb \
 		$(TINYRFD_ARGS)
@@ -92,7 +95,8 @@ tinyrfdeter-train-m:
 .PHONY: tinyrfdeter-smoke
 tinyrfdeter-smoke:
 	WANDB_MODE=offline uv run python -m cpa.tinyrfdeter.lightning \
-		--data-root $(TINYRFD_DATA) \
+		--data-root $(TINYRFD_DATA) $(if $(TINYRFD_VAL_DATA),--val-data-root $(TINYRFD_VAL_DATA),) \
+		--train-image-set $(TINYRFD_TRAIN_IMAGE_SET) \
 		--variant n \
 		--image-size 96 \
 		--batch-size 1 \
