@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import Any
 
@@ -21,9 +22,31 @@ from cpa.tinyrfdeter.model import (
     config_for_variant,
 )
 
+MAP_METRIC_KEYS = (
+    ("bbox_map", "mAP50-95_box"),
+    ("bbox_map_50", "mAP50_box"),
+    ("bbox_map_75", "mAP75_box"),
+    ("map", "mAP50-95_box"),
+    ("map_50", "mAP50_box"),
+    ("map_75", "mAP75_box"),
+    ("segm_map", "mAP50-95_mask"),
+    ("segm_map_50", "mAP50_mask"),
+    ("segm_map_75", "mAP75_mask"),
+)
+
 
 def _tensor_outputs(outputs: dict[str, Any]) -> dict[str, Tensor]:
     return {key: value for key, value in outputs.items() if isinstance(value, Tensor)}
+
+
+def _targets_to_device(targets: list[dict[str, Tensor]], device: torch.device) -> list[dict[str, Tensor]]:
+    return [
+        {
+            key: value.to(device, non_blocking=True) if isinstance(value, Tensor) else value
+            for key, value in target.items()
+        }
+        for target in targets
+    ]
 
 
 def _mask_iou_matrix(pred_masks: Tensor, target_masks: Tensor) -> Tensor:
@@ -106,10 +129,6 @@ class TinyRFDETRSegLightning(L.LightningModule):
             batch_size=images.shape[0],
         )
         self.log_dict(metrics, on_epoch=True, batch_size=images.shape[0])
-        self.map_metric.update(
-            self._map_predictions(outputs, image_size=images.shape[-2:]),
-            self._map_targets(targets, image_size=images.shape[-2:]),
-        )
         self._log_wandb_images(batch_idx, images, targets, outputs)
         return loss
 
@@ -189,22 +208,6 @@ class TinyRFDETRSegLightning(L.LightningModule):
             "val/predictions_per_image": prediction_count / max(len(targets), 1),
         }
 
-    def on_validation_epoch_end(self) -> None:
-        metrics = self.map_metric.compute()
-        self.map_metric.reset()
-        keys = {
-            "map": "val/mAP50-95_box",
-            "map_50": "val/mAP50_box",
-            "map_75": "val/mAP75_box",
-            "segm_map": "val/mAP50-95_mask",
-            "segm_map_50": "val/mAP50_mask",
-            "segm_map_75": "val/mAP75_mask",
-        }
-        for source, target in keys.items():
-            value = metrics.get(source)
-            if value is not None:
-                self.log(target, value, prog_bar=source in {"segm_map", "segm_map_50"}, sync_dist=True)
-
     @torch.no_grad()
     def _map_predictions(
         self, outputs: dict[str, Tensor], *, image_size: tuple[int, int]
@@ -249,6 +252,25 @@ class TinyRFDETRSegLightning(L.LightningModule):
         height, width = image_size
         scale = boxes.new_tensor([width, height, width, height])
         return box_cxcywh_to_xyxy(boxes).clamp(0, 1) * scale
+
+    @torch.no_grad()
+    def update_map_metric(self, images: Tensor, targets: list[dict[str, Tensor]]) -> None:
+        outputs = _tensor_outputs(self(images))
+        self.map_metric.update(
+            self._map_predictions(outputs, image_size=images.shape[-2:]),
+            self._map_targets(targets, image_size=images.shape[-2:]),
+        )
+
+    def compute_map_metrics(self, *, prefix: str) -> dict[str, float]:
+        metrics = self.map_metric.compute()
+        self.map_metric.reset()
+        logged = {}
+        for source, target in MAP_METRIC_KEYS:
+            value = metrics.get(source)
+            metric_name = f"{prefix}/{target}"
+            if value is not None and metric_name not in logged:
+                logged[metric_name] = float(value.detach().cpu().item())
+        return logged
 
     @torch.no_grad()
     def _log_wandb_images(
@@ -367,6 +389,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--score-threshold", type=float, default=0.25)
     parser.add_argument("--map-top-k", type=int, default=100)
+    parser.add_argument("--final-map", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--final-map-limit-batches", type=_limit_batches, default=1.0)
     parser.add_argument("--log-images-every-n-epochs", type=int, default=1)
     parser.add_argument("--accelerator", default="auto")
     parser.add_argument("--devices", default="auto")
@@ -383,6 +407,18 @@ def _limit_batches(value: str) -> int | float:
 
 def _trainer_devices(value: str) -> str | int:
     return int(value) if value.isdigit() else value
+
+
+def _limited_batch_count(limit: int | float, total_batches: int) -> int:
+    if total_batches <= 0:
+        return 0
+    if isinstance(limit, int):
+        return min(limit, total_batches)
+    if limit <= 0:
+        return 0
+    if limit <= 1:
+        return min(max(1, math.ceil(total_batches * limit)), total_batches)
+    return min(int(limit), total_batches)
 
 
 def _has_coco_val(root: Path) -> bool:
@@ -409,6 +445,44 @@ def set_torch_sharing_strategy(strategy: str) -> None:
     if strategy not in available:
         raise ValueError(f"Sharing strategy {strategy!r} is unavailable. Available: {sorted(available)}")
     torch.multiprocessing.set_sharing_strategy(strategy)
+
+
+@torch.no_grad()
+def run_final_map_benchmark(
+    *,
+    trainer: L.Trainer,
+    model: TinyRFDETRSegLightning,
+    datamodule: CocoPremadeDataModule,
+    limit_batches: int | float,
+) -> dict[str, float]:
+    dataloader = datamodule.val_dataloader()
+    total_batches = len(dataloader)
+    max_batches = _limited_batch_count(limit_batches, total_batches)
+    if max_batches <= 0:
+        raise ValueError("--final-map-limit-batches must select at least one validation batch.")
+
+    print(f"Running final mAP benchmark on {max_batches}/{total_batches} validation batches.")
+    was_training = model.training
+    model.eval()
+    model.map_metric.reset()
+    device = model.device
+
+    for batch_idx, (images, targets) in enumerate(dataloader):
+        if batch_idx >= max_batches:
+            break
+        images = images.to(device, non_blocking=True)
+        targets = _targets_to_device(targets, device)
+        model.update_map_metric(images, targets)
+
+    metrics = model.compute_map_metrics(prefix="benchmark")
+    if trainer.logger is not None:
+        trainer.logger.log_metrics(metrics, step=trainer.global_step)
+    summary = " ".join(f"{name}={value:.4f}" for name, value in sorted(metrics.items()))
+    print(f"Final mAP benchmark: {summary}")
+
+    if was_training:
+        model.train()
+    return metrics
 
 
 def main() -> None:
@@ -493,6 +567,13 @@ def main() -> None:
         log_every_n_steps=10,
     )
     trainer.fit(model, datamodule=dm)
+    if args.final_map:
+        run_final_map_benchmark(
+            trainer=trainer,
+            model=model,
+            datamodule=dm,
+            limit_batches=args.final_map_limit_batches,
+        )
 
 
 if __name__ == "__main__":
