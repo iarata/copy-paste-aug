@@ -168,6 +168,7 @@ class TinyRFDETRSegLightning(L.LightningModule):
         max_log_images: int = 4,
         max_log_instances: int = 20,
         map_top_k: int = 100,
+        compute_val_extra_metrics: bool = True,
         return_aux: bool = False,
     ) -> None:
         super().__init__()
@@ -215,7 +216,6 @@ class TinyRFDETRSegLightning(L.LightningModule):
         outputs = _tensor_outputs(self(images))
         losses = self.criterion(outputs, targets)
         loss = self.criterion.weighted_loss(losses)
-        metrics = self._validation_metrics(outputs, targets, image_size=images.shape[-2:])
 
         self.log("val/loss", loss, prog_bar=True, on_epoch=True, batch_size=images.shape[0])
         self.log_dict(
@@ -223,7 +223,9 @@ class TinyRFDETRSegLightning(L.LightningModule):
             on_epoch=True,
             batch_size=images.shape[0],
         )
-        self.log_dict(metrics, on_epoch=True, batch_size=images.shape[0])
+        if bool(self.hparams.compute_val_extra_metrics):
+            metrics = self._validation_metrics(outputs, targets, image_size=images.shape[-2:])
+            self.log_dict(metrics, on_epoch=True, batch_size=images.shape[0])
         self._log_wandb_images(batch_idx, images, targets, outputs)
         return loss
 
@@ -527,12 +529,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--map-top-k", type=int, default=100)
     parser.add_argument("--final-map", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--final-map-limit-batches", type=_limit_batches, default=1.0)
+    parser.add_argument(
+        "--val-extra-metrics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compute extra validation IoU/precision/recall diagnostics. Disable to speed up validation.",
+    )
     parser.add_argument("--log-images-every-n-epochs", type=int, default=1)
     parser.add_argument("--accelerator", default="auto")
     parser.add_argument("--devices", default="auto")
-    parser.add_argument("--precision", default="32-true")
+    parser.add_argument(
+        "--precision",
+        default="auto",
+        help="Lightning precision. 'auto' uses bf16-mixed on supported CUDA GPUs, 16-mixed on other CUDA GPUs, "
+        "and 32-true on CPU/MPS.",
+    )
     parser.add_argument("--limit-train-batches", type=_limit_batches, default=1.0)
     parser.add_argument("--limit-val-batches", type=_limit_batches, default=1.0)
+    parser.add_argument("--check-val-every-n-epoch", type=_positive_int, default=1)
+    parser.add_argument("--log-every-n-steps", type=_positive_int, default=10)
     parser.add_argument("--fast-dev-run", action="store_true")
     return parser.parse_args()
 
@@ -541,8 +556,25 @@ def _limit_batches(value: str) -> int | float:
     return float(value) if "." in value else int(value)
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be >= 1")
+    return parsed
+
+
 def _trainer_devices(value: str) -> str | int:
     return int(value) if value.isdigit() else value
+
+
+def resolve_precision(precision: str) -> str:
+    if precision != "auto":
+        return precision
+    if not torch.cuda.is_available():
+        return "32-true"
+    if torch.cuda.is_bf16_supported():
+        return "bf16-mixed"
+    return "16-mixed"
 
 
 def _limited_batch_count(limit: int | float, total_batches: int) -> int:
@@ -626,6 +658,7 @@ def main() -> None:
     set_torch_sharing_strategy(args.sharing_strategy)
     L.seed_everything(args.seed, workers=True)
     torch.set_float32_matmul_precision("high")
+    precision = resolve_precision(str(args.precision))
 
     cfg = config_for_variant(args.variant, image_size=args.image_size)
     val_root = resolve_val_root(args.data_root, args.val_data_root)
@@ -651,7 +684,9 @@ def main() -> None:
         f"train_root={dm.train_root} train_image_set={args.train_image_set} train_images={train_count} "
         f"val_root={dm.val_root} val_images={val_count} "
         f"workers={args.num_workers} pin_memory={args.pin_memory} "
-        f"prefetch_factor={args.prefetch_factor} sharing_strategy={args.sharing_strategy}"
+        f"prefetch_factor={args.prefetch_factor} sharing_strategy={args.sharing_strategy} "
+        f"precision={precision} val_extra_metrics={args.val_extra_metrics} "
+        f"check_val_every_n_epoch={args.check_val_every_n_epoch}"
     )
 
     model = TinyRFDETRSegLightning(
@@ -669,6 +704,7 @@ def main() -> None:
         score_threshold=args.score_threshold,
         log_images_every_n_epochs=args.log_images_every_n_epochs,
         map_top_k=args.map_top_k,
+        compute_val_extra_metrics=args.val_extra_metrics,
     )
 
     logger = None
@@ -689,6 +725,7 @@ def main() -> None:
             mode="min",
             save_last=True,
             auto_insert_metric_name=False,
+            save_on_train_epoch_end=False,
         ),
     ]
     if logger is not None:
@@ -698,14 +735,15 @@ def main() -> None:
         max_epochs=args.epochs,
         accelerator=args.accelerator,
         devices=_trainer_devices(str(args.devices)),
-        precision=args.precision,
+        precision=precision,
         logger=logger,
         callbacks=callbacks,
         default_root_dir=str(args.output_dir),
         limit_train_batches=args.limit_train_batches,
         limit_val_batches=args.limit_val_batches,
         fast_dev_run=args.fast_dev_run,
-        log_every_n_steps=10,
+        check_val_every_n_epoch=args.check_val_every_n_epoch,
+        log_every_n_steps=args.log_every_n_steps,
     )
     trainer.fit(model, datamodule=dm)
     if args.final_map:
