@@ -347,6 +347,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--prefetch-factor", type=int, default=1)
+    parser.add_argument(
+        "--sharing-strategy",
+        choices=["file_system", "file_descriptor"],
+        default="file_system",
+        help="PyTorch multiprocessing tensor sharing strategy. file_system avoids low open-file limits.",
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--train-subset-percent", type=float, default=100.0)
@@ -395,8 +404,16 @@ def resolve_val_root(train_root: Path, explicit_val_root: Path | None) -> Path:
     return train_root
 
 
+def set_torch_sharing_strategy(strategy: str) -> None:
+    available = torch.multiprocessing.get_all_sharing_strategies()
+    if strategy not in available:
+        raise ValueError(f"Sharing strategy {strategy!r} is unavailable. Available: {sorted(available)}")
+    torch.multiprocessing.set_sharing_strategy(strategy)
+
+
 def main() -> None:
     args = parse_args()
+    set_torch_sharing_strategy(args.sharing_strategy)
     L.seed_everything(args.seed, workers=True)
     torch.set_float32_matmul_precision("high")
 
@@ -412,6 +429,9 @@ def main() -> None:
         train_subset_percent=args.train_subset_percent,
         val_subset_percent=args.val_subset_percent,
         seed=args.seed,
+        pin_memory=args.pin_memory,
+        persistent_workers=args.persistent_workers,
+        prefetch_factor=args.prefetch_factor,
     )
     dm.setup("fit")
     train_count = len(dm.train_dataset) if dm.train_dataset is not None else 0
@@ -419,7 +439,9 @@ def main() -> None:
     print(
         "TinyRFDETR data: "
         f"train_root={dm.train_root} train_image_set={args.train_image_set} train_images={train_count} "
-        f"val_root={dm.val_root} val_images={val_count}"
+        f"val_root={dm.val_root} val_images={val_count} "
+        f"workers={args.num_workers} pin_memory={args.pin_memory} "
+        f"prefetch_factor={args.prefetch_factor} sharing_strategy={args.sharing_strategy}"
     )
 
     model = TinyRFDETRSegLightning(

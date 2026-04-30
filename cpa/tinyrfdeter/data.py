@@ -233,7 +233,8 @@ class CocoPremadeInstanceSegDataset(Dataset):
         height = int(info["height"])
         width = int(info["width"])
         image_path = resolve_image_path(self.image_dir, str(info["file_name"]))
-        image = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.uint8)
+        with Image.open(image_path) as pil_image:
+            image = np.asarray(pil_image.convert("RGB"), dtype=np.uint8)
 
         masks = []
         labels = []
@@ -301,8 +302,9 @@ class CocoPremadeDataModule(L.LightningDataModule):
         train_subset_percent: float = 100.0,
         val_subset_percent: float = 100.0,
         seed: int = 0,
-        pin_memory: bool = True,
+        pin_memory: bool = False,
         persistent_workers: bool = True,
+        prefetch_factor: int | None = 1,
     ) -> None:
         super().__init__()
         self.train_root = Path(train_root)
@@ -316,6 +318,7 @@ class CocoPremadeDataModule(L.LightningDataModule):
         self.seed = int(seed)
         self.pin_memory = bool(pin_memory)
         self.persistent_workers = bool(persistent_workers)
+        self.prefetch_factor = prefetch_factor
         self.train_dataset: CocoPremadeInstanceSegDataset | None = None
         self.val_dataset: CocoPremadeInstanceSegDataset | None = None
 
@@ -367,12 +370,16 @@ class CocoPremadeDataModule(L.LightningDataModule):
         return self._build_loader(self.val_dataset, shuffle=False)
 
     def _build_loader(self, dataset: Dataset, *, shuffle: bool) -> DataLoader:
-        return DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=shuffle,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers and self.num_workers > 0,
-            collate_fn=collate_instances,
-        )
+        kwargs: dict[str, Any] = {
+            "dataset": dataset,
+            "batch_size": self.batch_size,
+            "shuffle": shuffle,
+            "num_workers": self.num_workers,
+            "pin_memory": self.pin_memory,
+            "collate_fn": collate_instances,
+        }
+        if self.num_workers > 0:
+            kwargs["persistent_workers"] = self.persistent_workers
+            if self.prefetch_factor is not None:
+                kwargs["prefetch_factor"] = self.prefetch_factor
+        return DataLoader(**kwargs)
