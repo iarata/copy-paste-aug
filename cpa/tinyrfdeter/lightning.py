@@ -21,6 +21,7 @@ from cpa.tinyrfdeter.model import (
     build_tinyrfdetrseg,
     config_for_variant,
 )
+from cpa.tinyrfdeter.muon import MuSGD
 
 MAP_METRIC_KEYS = (
     ("bbox_map", "mAP50-95_box"),
@@ -49,6 +50,94 @@ def _targets_to_device(targets: list[dict[str, Tensor]], device: torch.device) -
     ]
 
 
+def _numel(parameters: list[torch.nn.Parameter]) -> int:
+    return sum(parameter.numel() for parameter in parameters)
+
+
+def _is_no_decay_parameter(name: str, parameter: torch.nn.Parameter) -> bool:
+    lowered = name.lower()
+    return parameter.ndim < 2 or name.endswith(".bias") or "norm" in lowered or "pos_embed" in lowered
+
+
+def build_musgd_optimizer(
+    module: torch.nn.Module,
+    *,
+    lr: float,
+    weight_decay: float,
+    momentum: float,
+    nesterov: bool,
+    muon_scale: float,
+    sgd_scale: float,
+) -> tuple[MuSGD, dict[str, Any]]:
+    muon_params: list[torch.nn.Parameter] = []
+    sgd_decay_params: list[torch.nn.Parameter] = []
+    sgd_no_decay_params: list[torch.nn.Parameter] = []
+
+    for name, parameter in module.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if parameter.ndim in {2, 4}:
+            muon_params.append(parameter)
+        elif _is_no_decay_parameter(name, parameter):
+            sgd_no_decay_params.append(parameter)
+        else:
+            sgd_decay_params.append(parameter)
+
+    common = {"lr": lr, "momentum": momentum, "nesterov": nesterov}
+    param_groups: list[dict[str, Any]] = []
+    if muon_params:
+        param_groups.append(
+            {
+                "params": muon_params,
+                **common,
+                "weight_decay": weight_decay,
+                "use_muon": True,
+                "param_group": "muon",
+            }
+        )
+    if sgd_decay_params:
+        param_groups.append(
+            {
+                "params": sgd_decay_params,
+                **common,
+                "weight_decay": weight_decay,
+                "use_muon": False,
+                "param_group": "sgd_decay",
+            }
+        )
+    if sgd_no_decay_params:
+        param_groups.append(
+            {
+                "params": sgd_no_decay_params,
+                **common,
+                "weight_decay": 0.0,
+                "use_muon": False,
+                "param_group": "sgd_no_decay",
+            }
+        )
+
+    info = {
+        "optimizer": "musgd",
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "momentum": momentum,
+        "nesterov": nesterov,
+        "musgd_muon_scale": muon_scale,
+        "musgd_sgd_scale": sgd_scale,
+        "musgd_muon_params": len(muon_params),
+        "musgd_muon_numel": _numel(muon_params),
+        "musgd_sgd_decay_params": len(sgd_decay_params),
+        "musgd_sgd_decay_numel": _numel(sgd_decay_params),
+        "musgd_sgd_no_decay_params": len(sgd_no_decay_params),
+        "musgd_sgd_no_decay_numel": _numel(sgd_no_decay_params),
+    }
+    return MuSGD(param_groups, muon=muon_scale, sgd=sgd_scale), info
+
+
+def format_optimizer_info(info: dict[str, Any]) -> str:
+    return " ".join(f"{key}={value}" for key, value in info.items())
+
+
 def _mask_iou_matrix(pred_masks: Tensor, target_masks: Tensor) -> Tensor:
     if pred_masks.numel() == 0 or target_masks.numel() == 0:
         return pred_masks.new_zeros((pred_masks.shape[0], target_masks.shape[0]), dtype=torch.float32)
@@ -69,6 +158,11 @@ class TinyRFDETRSegLightning(L.LightningModule):
         image_size: int | None = None,
         lr: float = 1e-4,
         weight_decay: float = 1e-4,
+        optimizer: str = "adamw",
+        momentum: float = 0.95,
+        nesterov: bool = True,
+        musgd_muon_scale: float = 0.5,
+        musgd_sgd_scale: float = 0.5,
         score_threshold: float = 0.25,
         log_images_every_n_epochs: int = 1,
         max_log_images: int = 4,
@@ -86,6 +180,7 @@ class TinyRFDETRSegLightning(L.LightningModule):
             return_aux=return_aux,
         )
         self.criterion = TinyRFDETRSegCriterion(num_classes=num_classes)
+        self._optimizer_info: dict[str, Any] = {}
         try:
             from torchmetrics.detection.mean_ap import MeanAveragePrecision
         except ImportError as exc:
@@ -133,11 +228,47 @@ class TinyRFDETRSegLightning(L.LightningModule):
         return loss
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
-        return torch.optim.AdamW(
-            self.parameters(),
-            lr=float(self.hparams.lr),
-            weight_decay=float(self.hparams.weight_decay),
-        )
+        optimizer_name = str(self.hparams.optimizer).lower()
+        lr = float(self.hparams.lr)
+        weight_decay = float(self.hparams.weight_decay)
+        if optimizer_name == "adamw":
+            optimizer = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=weight_decay)
+            self._optimizer_info = {
+                "optimizer": "adamw",
+                "lr": lr,
+                "weight_decay": weight_decay,
+                "trainable_params": sum(
+                    parameter.numel() for parameter in self.parameters() if parameter.requires_grad
+                ),
+            }
+        elif optimizer_name == "musgd":
+            optimizer, self._optimizer_info = build_musgd_optimizer(
+                self,
+                lr=lr,
+                weight_decay=weight_decay,
+                momentum=float(self.hparams.momentum),
+                nesterov=bool(self.hparams.nesterov),
+                muon_scale=float(self.hparams.musgd_muon_scale),
+                sgd_scale=float(self.hparams.musgd_sgd_scale),
+            )
+        else:
+            raise ValueError(f"Unsupported optimizer {self.hparams.optimizer!r}. Use 'adamw' or 'musgd'.")
+
+        print(f"TinyRFDETR optimizer: {format_optimizer_info(self._optimizer_info)}")
+        return optimizer
+
+    def on_fit_start(self) -> None:
+        if not self._optimizer_info or self.logger is None:
+            return
+        values = {f"optimizer/{key}": value for key, value in self._optimizer_info.items()}
+        self.logger.log_hyperparams(values)
+        experiment = getattr(self.logger, "experiment", None)
+        config = getattr(experiment, "config", None)
+        if config is not None and hasattr(config, "update"):
+            try:
+                config.update(values, allow_val_change=True)
+            except TypeError:
+                config.update(values)
 
     @torch.no_grad()
     def _validation_metrics(
@@ -380,6 +511,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--optimizer", choices=["adamw", "musgd"], default="adamw")
+    parser.add_argument("--momentum", type=float, default=0.95)
+    parser.add_argument("--nesterov", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--musgd-muon-scale", type=float, default=0.5)
+    parser.add_argument("--musgd-sgd-scale", type=float, default=0.5)
     parser.add_argument("--train-subset-percent", type=float, default=100.0)
     parser.add_argument("--val-subset-percent", type=float, default=100.0)
     parser.add_argument("--seed", type=int, default=0)
@@ -525,6 +661,11 @@ def main() -> None:
         image_size=cfg.image_size,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        optimizer=args.optimizer,
+        momentum=args.momentum,
+        nesterov=args.nesterov,
+        musgd_muon_scale=args.musgd_muon_scale,
+        musgd_sgd_scale=args.musgd_sgd_scale,
         score_threshold=args.score_threshold,
         log_images_every_n_epochs=args.log_images_every_n_epochs,
         map_top_k=args.map_top_k,
