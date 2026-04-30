@@ -125,6 +125,30 @@ def xyxy_to_normalized_cxcywh(boxes: Tensor, height: int, width: int) -> Tensor:
     return torch.stack((cx, cy, box_w, box_h), dim=1).clamp(0, 1)
 
 
+def resolve_image_path(image_dir: Path, file_name: str) -> Path:
+    """Resolve COCO image records without letting absolute JSON paths override data-root."""
+    file_path = Path(file_name)
+    candidates = [
+        image_dir / file_path.name,
+        image_dir / file_path,
+        image_dir.parent / file_path,
+    ]
+    if file_path.is_absolute():
+        candidates.append(file_path)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    tried = "\n".join(f"  - {candidate}" for candidate in candidates)
+    raise FileNotFoundError(
+        "Could not find image for COCO record "
+        f"{file_name!r}. Tried:\n{tried}\n"
+        "If this is a premade dataset copied without raw COCO2017, regenerate it with "
+        "--no-cleanup-aliases or copy the raw images referenced by the annotation JSON."
+    )
+
+
 class CocoPremadeInstanceSegDataset(Dataset):
     def __init__(
         self,
@@ -176,7 +200,7 @@ class CocoPremadeInstanceSegDataset(Dataset):
         info = self.images[image_id]
         height = int(info["height"])
         width = int(info["width"])
-        image_path = self.image_dir / info["file_name"]
+        image_path = resolve_image_path(self.image_dir, str(info["file_name"]))
         image = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.uint8)
 
         masks = []
