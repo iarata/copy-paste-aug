@@ -63,6 +63,45 @@ create-env:
 train:
 	uv run python -m cpa.training $(ARGS)
 
+TINYRFD_DATA ?= data.nosync/processed/coco2017_simple_cp_seed42_sub50
+TINYRFD_VARIANT ?= n
+TINYRFD_ARGS ?=
+WANDB_MODE ?= offline
+
+## Train tiny RF-DETR segmentation on a premade COCO2017 dataset
+.PHONY: tinyrfdeter-train
+tinyrfdeter-train:
+	WANDB_MODE=$(WANDB_MODE) uv run python -m cpa.tinyrfdeter.lightning \
+		--data-root $(TINYRFD_DATA) \
+		--variant $(TINYRFD_VARIANT) \
+		--wandb \
+		$(TINYRFD_ARGS)
+
+.PHONY: tinyrfdeter-train-n
+tinyrfdeter-train-n:
+	$(MAKE) tinyrfdeter-train TINYRFD_VARIANT=n
+
+.PHONY: tinyrfdeter-train-s
+tinyrfdeter-train-s:
+	$(MAKE) tinyrfdeter-train TINYRFD_VARIANT=s
+
+.PHONY: tinyrfdeter-train-m
+tinyrfdeter-train-m:
+	$(MAKE) tinyrfdeter-train TINYRFD_VARIANT=m
+
+.PHONY: tinyrfdeter-smoke
+tinyrfdeter-smoke:
+	WANDB_MODE=offline uv run python -m cpa.tinyrfdeter.lightning \
+		--data-root $(TINYRFD_DATA) \
+		--variant n \
+		--image-size 96 \
+		--batch-size 1 \
+		--num-workers 0 \
+		--train-subset-percent 0.1 \
+		--val-subset-percent 0.1 \
+		--wandb \
+		--fast-dev-run
+
 .PHONY: download-coco
 download-coco:
 ifeq ($(OUTPUT),)

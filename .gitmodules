@@ -1,3 +1,6 @@
 [submodule "cpa/libcom"]
 	path = cpa/libcom
 	url = https://github.com/bcmi/libcom
+[submodule "cpa/rf-detr"]
+	path = cpa/rf-detr
+	url = https://github.com/roboflow/rf-detr
