@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 from pathlib import Path
+import re
 from typing import Any
 
 import lightning as L
@@ -34,6 +35,7 @@ MAP_METRIC_KEYS = (
     ("segm_map_50", "mAP50_mask"),
     ("segm_map_75", "mAP75_mask"),
 )
+_SAFE_PATH_COMPONENT = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 def _tensor_outputs(outputs: dict[str, Any]) -> dict[str, Tensor]:
@@ -563,6 +565,19 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def training_dataset_name(data_root: Path) -> str:
+    """Return a stable path component for the dataset used by Tiny RF-DETR training."""
+
+    raw_name = data_root.expanduser().name or "dataset"
+    safe_name = _SAFE_PATH_COMPONENT.sub("_", raw_name.strip()).strip("._-")
+    return safe_name or "dataset"
+
+
+def checkpoint_dir_for_run(output_dir: Path, *, variant: str, data_root: Path) -> Path:
+    dataset_name = training_dataset_name(data_root)
+    return output_dir / f"rf-deter-seg-{variant}-{dataset_name}"
+
+
 def _trainer_devices(value: str) -> str | int:
     return int(value) if value.isdigit() else value
 
@@ -716,7 +731,8 @@ def main() -> None:
             log_model=False,
         )
 
-    checkpoint_dir = args.output_dir / f"rf-deter-seg-{args.variant}"
+    checkpoint_dir = checkpoint_dir_for_run(args.output_dir, variant=args.variant, data_root=args.data_root)
+    print(f"TinyRFDETR checkpoints: {checkpoint_dir}")
     callbacks = [
         ModelCheckpoint(
             dirpath=checkpoint_dir,

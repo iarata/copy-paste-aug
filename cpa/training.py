@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 from typing import cast
 
 import hydra
@@ -19,6 +20,8 @@ from cpa.yolo.data import COCOJsonDataModule, resolve_path
 from cpa.yolo.lightning import YOLO26LightningModule, evaluate_checkpoint
 
 register_configs()
+
+_SAFE_PATH_COMPONENT = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 def resolve_precision(precision: str) -> str:
@@ -69,9 +72,20 @@ def update_wandb_summary(wandb_logger: WandbLogger | None, payload: dict[str, ob
         summary.update(payload)
 
 
+def checkpoint_dataset_name(cfg: Config) -> str:
+    """Return a stable path component naming the dataset used for training."""
+
+    dataset_root = str(getattr(cfg.dataset, "root", "") or "").replace("\\", "/").rstrip("/")
+    root_name = Path(dataset_root).name if dataset_root else ""
+    raw_name = root_name or str(getattr(cfg.dataset, "name", "") or "dataset")
+    safe_name = _SAFE_PATH_COMPONENT.sub("_", raw_name.strip()).strip("._-")
+    return safe_name or "dataset"
+
+
 def build_trainer(cfg: Config, wandb_logger: WandbLogger | None, default_root_dir: Path) -> L.Trainer:
+    checkpoint_dir = default_root_dir / "checkpoints" / checkpoint_dataset_name(cfg)
     checkpoint_callback = ModelCheckpoint(
-        dirpath=default_root_dir / "checkpoints",
+        dirpath=checkpoint_dir,
         filename="epoch-{epoch:03d}",
         monitor="val/loss",
         mode="min",
