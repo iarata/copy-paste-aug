@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 from pathlib import Path
 import re
 from typing import Any
 
 import lightning as L
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 import numpy as np
 import torch
@@ -36,6 +37,7 @@ MAP_METRIC_KEYS = (
     ("segm_map_75", "mAP75_mask"),
 )
 _SAFE_PATH_COMPONENT = re.compile(r"[^A-Za-z0-9_.-]+")
+_BYTES_PER_GIB = 1024**3
 
 
 def _tensor_outputs(outputs: dict[str, Any]) -> dict[str, Tensor]:
@@ -138,6 +140,143 @@ def build_musgd_optimizer(
 
 def format_optimizer_info(info: dict[str, Any]) -> str:
     return " ".join(f"{key}={value}" for key, value in info.items())
+
+
+def _read_int_file(path: Path) -> int | None:
+    try:
+        value = path.read_text().strip()
+    except OSError:
+        return None
+    if value == "max":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _process_memory_stats() -> dict[str, float]:
+    stats: dict[str, float] = {}
+    try:
+        import psutil
+    except ImportError:
+        psutil = None
+
+    if psutil is not None:
+        process = psutil.Process()
+        children = process.children(recursive=True)
+        main_rss = process.memory_info().rss
+        child_rss = 0
+        for child in children:
+            try:
+                child_rss += child.memory_info().rss
+            except psutil.Error:
+                continue
+        stats["system/main_rss_gib"] = main_rss / _BYTES_PER_GIB
+        stats["system/child_rss_gib"] = child_rss / _BYTES_PER_GIB
+        stats["system/total_rss_gib"] = (main_rss + child_rss) / _BYTES_PER_GIB
+        stats["system/child_processes"] = float(len(children))
+        try:
+            stats["system/open_fds"] = float(process.num_fds())
+        except (AttributeError, psutil.Error):
+            pass
+        return stats
+
+    status = Path("/proc/self/status")
+    try:
+        lines = status.read_text().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        if line.startswith("VmRSS:"):
+            stats["system/main_rss_gib"] = int(line.split()[1]) * 1024 / _BYTES_PER_GIB
+        elif line.startswith("VmHWM:"):
+            stats["system/main_rss_high_water_gib"] = int(line.split()[1]) * 1024 / _BYTES_PER_GIB
+    fd_dir = Path("/proc/self/fd")
+    if fd_dir.exists():
+        try:
+            stats["system/open_fds"] = float(len(os.listdir(fd_dir)))
+        except OSError:
+            pass
+    return stats
+
+
+def _cgroup_memory_stats() -> dict[str, float]:
+    stats: dict[str, float] = {}
+    current = _read_int_file(Path("/sys/fs/cgroup/memory.current"))
+    limit = _read_int_file(Path("/sys/fs/cgroup/memory.max"))
+    if current is None:
+        current = _read_int_file(Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"))
+    if limit is None:
+        limit = _read_int_file(Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+    if current is not None:
+        stats["system/cgroup_memory_gib"] = current / _BYTES_PER_GIB
+    if limit is not None and limit < 1 << 60:
+        stats["system/cgroup_memory_limit_gib"] = limit / _BYTES_PER_GIB
+    return stats
+
+
+def _cuda_memory_stats() -> dict[str, float]:
+    if not torch.cuda.is_available():
+        return {}
+    device = torch.cuda.current_device()
+    return {
+        "system/cuda_allocated_gib": torch.cuda.memory_allocated(device) / _BYTES_PER_GIB,
+        "system/cuda_reserved_gib": torch.cuda.memory_reserved(device) / _BYTES_PER_GIB,
+        "system/cuda_max_allocated_gib": torch.cuda.max_memory_allocated(device) / _BYTES_PER_GIB,
+        "system/cuda_max_reserved_gib": torch.cuda.max_memory_reserved(device) / _BYTES_PER_GIB,
+    }
+
+
+def collect_system_stats() -> dict[str, float]:
+    stats = _process_memory_stats()
+    stats.update(_cgroup_memory_stats())
+    stats.update(_cuda_memory_stats())
+    return stats
+
+
+class SystemStatsCallback(Callback):
+    def __init__(self, *, every_n_train_steps: int) -> None:
+        self.every_n_train_steps = int(every_n_train_steps)
+        self._last_logged_step = -1
+
+    def on_train_batch_end(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        outputs: Any,
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        del pl_module, outputs, batch, batch_idx
+        if self.every_n_train_steps <= 0:
+            return
+        step = int(trainer.global_step)
+        if step == self._last_logged_step or step % self.every_n_train_steps != 0:
+            return
+        self._log(trainer, label="train")
+
+    def on_validation_epoch_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        del pl_module
+        self._log(trainer, label="val_start")
+
+    def on_validation_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        del pl_module
+        self._log(trainer, label="val_end")
+
+    def _log(self, trainer: L.Trainer, *, label: str) -> None:
+        step = int(trainer.global_step)
+        self._last_logged_step = step
+        stats = collect_system_stats()
+        if trainer.logger is not None:
+            try:
+                trainer.logger.log_metrics(stats, step=step)
+            except Exception as exc:  # pragma: no cover - logger failures should not kill training.
+                print(f"TinyRFDETR system stats logger failed: {exc}")
+        summary = " ".join(
+            f"{name.removeprefix('system/')}={value:.2f}" for name, value in sorted(stats.items())
+        )
+        print(f"TinyRFDETR system {label}: epoch={trainer.current_epoch} step={step} {summary}")
 
 
 def _mask_iou_matrix(pred_masks: Tensor, target_masks: Tensor) -> Tensor:
@@ -502,11 +641,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--variant", choices=["n", "s", "m"], default="n")
     parser.add_argument("--image-size", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument(
+        "--val-batch-size",
+        type=int,
+        default=None,
+        help="Validation batch size. Defaults to --batch-size.",
+    )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--val-num-workers",
+        type=int,
+        default=None,
+        help="Validation DataLoader workers. Defaults to --num-workers.",
+    )
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--val-pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Pin validation DataLoader memory. Defaults to --pin-memory.",
+    )
     parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--val-persistent-workers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Keep validation workers alive between validation epochs. Disabled by default to release RAM.",
+    )
     parser.add_argument("--prefetch-factor", type=int, default=1)
+    parser.add_argument(
+        "--val-prefetch-factor",
+        type=int,
+        default=None,
+        help="Validation prefetch factor. Defaults to --prefetch-factor.",
+    )
     parser.add_argument(
         "--sharing-strategy",
         choices=["file_system", "file_descriptor"],
@@ -550,6 +719,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-val-batches", type=_limit_batches, default=1.0)
     parser.add_argument("--check-val-every-n-epoch", type=_positive_int, default=1)
     parser.add_argument("--log-every-n-steps", type=_positive_int, default=10)
+    parser.add_argument(
+        "--log-system-stats-every-n-steps",
+        type=_nonnegative_int,
+        default=0,
+        help="Print and log CPU RSS, child worker RSS, cgroup memory, open FDs, and CUDA memory. 0 disables.",
+    )
     parser.add_argument("--fast-dev-run", action="store_true")
     return parser.parse_args()
 
@@ -562,6 +737,13 @@ def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
         raise argparse.ArgumentTypeError("value must be >= 1")
+    return parsed
+
+
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be >= 0")
     return parsed
 
 
@@ -690,6 +872,11 @@ def main() -> None:
         pin_memory=args.pin_memory,
         persistent_workers=args.persistent_workers,
         prefetch_factor=args.prefetch_factor,
+        val_batch_size=args.val_batch_size,
+        val_num_workers=args.val_num_workers,
+        val_pin_memory=args.val_pin_memory,
+        val_persistent_workers=args.val_persistent_workers,
+        val_prefetch_factor=args.val_prefetch_factor,
     )
     dm.setup("fit")
     train_count = len(dm.train_dataset) if dm.train_dataset is not None else 0
@@ -698,8 +885,11 @@ def main() -> None:
         "TinyRFDETR data: "
         f"train_root={dm.train_root} train_image_set={args.train_image_set} train_images={train_count} "
         f"val_root={dm.val_root} val_images={val_count} "
-        f"workers={args.num_workers} pin_memory={args.pin_memory} "
-        f"prefetch_factor={args.prefetch_factor} sharing_strategy={args.sharing_strategy} "
+        f"train_batch_size={dm.batch_size} train_workers={dm.num_workers} train_pin_memory={dm.pin_memory} "
+        f"train_persistent_workers={dm.persistent_workers} train_prefetch_factor={dm.prefetch_factor} "
+        f"val_batch_size={dm.val_batch_size} val_workers={dm.val_num_workers} "
+        f"val_pin_memory={dm.val_pin_memory} val_persistent_workers={dm.val_persistent_workers} "
+        f"val_prefetch_factor={dm.val_prefetch_factor} sharing_strategy={args.sharing_strategy} "
         f"precision={precision} val_extra_metrics={args.val_extra_metrics} "
         f"check_val_every_n_epoch={args.check_val_every_n_epoch}"
     )
@@ -744,6 +934,8 @@ def main() -> None:
             save_on_train_epoch_end=False,
         ),
     ]
+    if args.log_system_stats_every_n_steps > 0:
+        callbacks.append(SystemStatsCallback(every_n_train_steps=args.log_system_stats_every_n_steps))
     if logger is not None:
         callbacks.append(LearningRateMonitor(logging_interval="epoch"))
 

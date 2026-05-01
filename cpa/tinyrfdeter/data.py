@@ -305,6 +305,11 @@ class CocoPremadeDataModule(L.LightningDataModule):
         pin_memory: bool = False,
         persistent_workers: bool = True,
         prefetch_factor: int | None = 1,
+        val_batch_size: int | None = None,
+        val_num_workers: int | None = None,
+        val_pin_memory: bool | None = None,
+        val_persistent_workers: bool | None = None,
+        val_prefetch_factor: int | None = None,
     ) -> None:
         super().__init__()
         self.train_root = Path(train_root)
@@ -319,6 +324,15 @@ class CocoPremadeDataModule(L.LightningDataModule):
         self.pin_memory = bool(pin_memory)
         self.persistent_workers = bool(persistent_workers)
         self.prefetch_factor = prefetch_factor
+        self.val_batch_size = int(val_batch_size) if val_batch_size is not None else self.batch_size
+        self.val_num_workers = int(val_num_workers) if val_num_workers is not None else self.num_workers
+        self.val_pin_memory = bool(val_pin_memory) if val_pin_memory is not None else self.pin_memory
+        self.val_persistent_workers = (
+            bool(val_persistent_workers) if val_persistent_workers is not None else self.persistent_workers
+        )
+        self.val_prefetch_factor = (
+            val_prefetch_factor if val_prefetch_factor is not None else self.prefetch_factor
+        )
         self.train_dataset: CocoPremadeInstanceSegDataset | None = None
         self.val_dataset: CocoPremadeInstanceSegDataset | None = None
 
@@ -362,24 +376,50 @@ class CocoPremadeDataModule(L.LightningDataModule):
     def train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:
             raise RuntimeError("Call setup('fit') before requesting the train dataloader.")
-        return self._build_loader(self.train_dataset, shuffle=True)
+        return self._build_loader(
+            self.train_dataset,
+            shuffle=True,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers,
+            prefetch_factor=self.prefetch_factor,
+        )
 
     def val_dataloader(self) -> DataLoader:
         if self.val_dataset is None:
             raise RuntimeError("Call setup('validate') or setup('fit') before requesting the val dataloader.")
-        return self._build_loader(self.val_dataset, shuffle=False)
+        return self._build_loader(
+            self.val_dataset,
+            shuffle=False,
+            batch_size=self.val_batch_size,
+            num_workers=self.val_num_workers,
+            pin_memory=self.val_pin_memory,
+            persistent_workers=self.val_persistent_workers,
+            prefetch_factor=self.val_prefetch_factor,
+        )
 
-    def _build_loader(self, dataset: Dataset, *, shuffle: bool) -> DataLoader:
+    def _build_loader(
+        self,
+        dataset: Dataset,
+        *,
+        shuffle: bool,
+        batch_size: int,
+        num_workers: int,
+        pin_memory: bool,
+        persistent_workers: bool,
+        prefetch_factor: int | None,
+    ) -> DataLoader:
         kwargs: dict[str, Any] = {
             "dataset": dataset,
-            "batch_size": self.batch_size,
+            "batch_size": batch_size,
             "shuffle": shuffle,
-            "num_workers": self.num_workers,
-            "pin_memory": self.pin_memory,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
             "collate_fn": collate_instances,
         }
-        if self.num_workers > 0:
-            kwargs["persistent_workers"] = self.persistent_workers
-            if self.prefetch_factor is not None:
-                kwargs["prefetch_factor"] = self.prefetch_factor
+        if num_workers > 0:
+            kwargs["persistent_workers"] = persistent_workers
+            if prefetch_factor is not None:
+                kwargs["prefetch_factor"] = prefetch_factor
         return DataLoader(**kwargs)
