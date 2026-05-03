@@ -26,7 +26,7 @@ import os
 from pathlib import Path
 import random
 import time
-from typing import Any, Iterable, Mapping, MutableMapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, MutableMapping, Sequence
 
 import numpy as np
 from PIL import Image
@@ -36,7 +36,7 @@ from pycocotools.cocoeval import COCOeval
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from torchvision.models import ResNet50_Weights
 from torchvision.models.detection import maskrcnn_resnet50_fpn, maskrcnn_resnet50_fpn_v2
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
@@ -144,12 +144,14 @@ class CocoInstanceSegmentation(Dataset):
         image_list: Path | None = None,
         transform: RandomHorizontalFlipForDetection | None = None,
         allow_empty: bool = True,
+        return_uint8_images: bool = True,
     ) -> None:
         self.image_dir = Path(image_dir)
         self.ann_file = Path(ann_file)
         self.coco = COCO(str(self.ann_file))
         self.transform = transform
         self.allow_empty = allow_empty
+        self.return_uint8_images = bool(return_uint8_images)
 
         self.cat_ids = sorted(self.coco.getCatIds())
         self.cat_id_to_label = {cat_id: ix + 1 for ix, cat_id in enumerate(self.cat_ids)}
@@ -186,7 +188,8 @@ class CocoInstanceSegmentation(Dataset):
         image_id = int(self.ids[idx])
         image_info = self.coco.loadImgs([image_id])[0]
         path = resolve_image_path(self.image_dir, str(image_info["file_name"]))
-        image_pil = Image.open(path).convert("RGB")
+        with Image.open(path) as pil:
+            image_pil = pil.convert("RGB")
         width, height = image_pil.size
 
         ann_ids = self.coco.getAnnIds(imgIds=[image_id])
@@ -224,7 +227,13 @@ class CocoInstanceSegmentation(Dataset):
             areas.append(float(ann.get("area", float(mask.sum()))))
             iscrowd.append(int(ann.get("iscrowd", 0)))
 
-        image = torch.as_tensor(np.asarray(image_pil), dtype=torch.float32).permute(2, 0, 1) / 255.0
+        # np.asarray(PIL.Image) can produce a read-only view. np.array(..., copy=True)
+        # keeps DataLoader workers from creating non-writable tensors and lets us
+        # ship uint8 images through multiprocessing instead of 4x-larger float32.
+        image_np = np.array(image_pil, dtype=np.uint8, copy=True)
+        image = torch.from_numpy(image_np).permute(2, 0, 1).contiguous()
+        if not self.return_uint8_images:
+            image = image.float().div_(255.0)
 
         if boxes:
             target: dict[str, Tensor] = {
@@ -257,6 +266,133 @@ def detection_collate(
 ) -> tuple[list[Tensor], list[dict[str, Tensor]]]:
     images, targets = zip(*batch)
     return list(images), list(targets)
+
+
+class AspectRatioGroupedBatchSampler(Sampler[list[int]]):
+    """Batch sampler that keeps similarly-shaped COCO images together.
+
+    TorchVision detection models pad a list of images to the largest height/width
+    in the batch. Mixing portrait and landscape images wastes GPU memory and time,
+    so this sampler builds each mini-batch from one coarse aspect-ratio bucket.
+    """
+
+    def __init__(
+        self,
+        dataset: CocoInstanceSegmentation,
+        batch_size: int,
+        *,
+        shuffle: bool = True,
+        drop_last: bool = False,
+        seed: int = 0,
+    ) -> None:
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.groups = [self._group_for_index(index) for index in range(len(dataset))]
+
+    def _group_for_index(self, index: int) -> int:
+        height, width = self.dataset.get_height_and_width(index)
+        # Four buckets are enough to reduce padding while keeping shuffling healthy.
+        ratio = float(width) / max(float(height), 1.0)
+        if ratio < 0.75:
+            return 0
+        if ratio < 1.0:
+            return 1
+        if ratio < 1.33:
+            return 2
+        return 3
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self) -> Iterator[list[int]]:
+        rng = random.Random(self.seed + self.epoch)
+        indices = list(range(len(self.dataset)))
+        if self.shuffle:
+            rng.shuffle(indices)
+
+        buckets: dict[int, list[int]] = defaultdict(list)
+        leftovers: list[list[int]] = []
+        for index in indices:
+            bucket = buckets[self.groups[index]]
+            bucket.append(index)
+            if len(bucket) == self.batch_size:
+                yield list(bucket)
+                bucket.clear()
+
+        for bucket in buckets.values():
+            if bucket:
+                leftovers.append(list(bucket))
+        if not self.drop_last:
+            if self.shuffle:
+                rng.shuffle(leftovers)
+            for bucket in leftovers:
+                yield bucket
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            counts: dict[int, int] = defaultdict(int)
+            for group in self.groups:
+                counts[group] += 1
+            return sum(count // self.batch_size for count in counts.values())
+        return math.ceil(len(self.dataset) / self.batch_size)
+
+
+def set_data_loader_epoch(data_loader: DataLoader, epoch: int) -> None:
+    batch_sampler = getattr(data_loader, "batch_sampler", None)
+    if hasattr(batch_sampler, "set_epoch"):
+        batch_sampler.set_epoch(epoch)
+
+
+def seed_worker(worker_id: int) -> None:
+    # Match torch's per-worker seed and propagate it to random/NumPy used by transforms.
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def make_detection_loader(
+    dataset: CocoInstanceSegmentation,
+    *,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    device: torch.device,
+    args: argparse.Namespace,
+    generator: torch.Generator | None = None,
+    aspect_ratio_grouping: bool = False,
+) -> DataLoader:
+    loader_kwargs: dict[str, Any] = {
+        "dataset": dataset,
+        "num_workers": int(num_workers),
+        "pin_memory": bool(args.pin_memory and device.type == "cuda"),
+        "collate_fn": detection_collate,
+        "worker_init_fn": seed_worker if num_workers > 0 else None,
+        "generator": generator,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(args.persistent_workers)
+        loader_kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
+        if args.dataloader_start_method != "default":
+            loader_kwargs["multiprocessing_context"] = args.dataloader_start_method
+
+    if aspect_ratio_grouping:
+        loader_kwargs["batch_sampler"] = AspectRatioGroupedBatchSampler(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=False,
+            seed=args.seed,
+        )
+    else:
+        loader_kwargs.update({"batch_size": batch_size, "shuffle": shuffle})
+
+    return DataLoader(**loader_kwargs)
 
 
 # -----------------------------------------------------------------------------
@@ -632,7 +768,10 @@ def run_coco_eval(
 
 
 def tensor_image_to_numpy(image: Tensor) -> np.ndarray:
-    array = image.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy()
+    image_cpu = image.detach().cpu()
+    if image_cpu.dtype == torch.uint8:
+        return image_cpu.permute(1, 2, 0).contiguous().numpy()
+    array = image_cpu.float().clamp(0, 1).permute(1, 2, 0).numpy()
     return (array * 255.0).round().astype(np.uint8)
 
 
@@ -733,6 +872,23 @@ def make_wandb_image(
     )
 
 
+def images_to_device(images: Sequence[Tensor], device: torch.device, non_blocking: bool) -> list[Tensor]:
+    """Move images to device and normalize only after transfer.
+
+    Returning uint8 CHW images from the Dataset reduces DataLoader IPC/shared-memory
+    traffic substantially. TorchVision detection models expect float images in [0, 1],
+    so conversion happens here immediately before the model call.
+    """
+
+    out: list[Tensor] = []
+    for image in images:
+        if image.dtype == torch.uint8:
+            out.append(image.to(device=device, non_blocking=non_blocking).float().div_(255.0))
+        else:
+            out.append(image.to(device=device, dtype=torch.float32, non_blocking=non_blocking))
+    return out
+
+
 @torch.no_grad()
 def validate(
     model: nn.Module,
@@ -756,7 +912,7 @@ def validate(
     for batch_idx, (images, targets) in enumerate(progress):
         if args.limit_val_batches and batch_idx >= args.limit_val_batches:
             break
-        images_device = [image.to(device, non_blocking=True) for image in images]
+        images_device = images_to_device(images, device, non_blocking=args.pin_memory)
         outputs = model(images_device)
         outputs = [{k: v.detach().cpu() for k, v in out.items()} for out in outputs]
         targets_cpu = [{k: v.detach().cpu() for k, v in target.items()} for target in targets]
@@ -813,9 +969,11 @@ def validate(
 
 
 def move_targets_to_device(
-    targets: Sequence[dict[str, Tensor]], device: torch.device
+    targets: Sequence[dict[str, Tensor]],
+    device: torch.device,
+    non_blocking: bool,
 ) -> list[dict[str, Tensor]]:
-    return [{k: v.to(device, non_blocking=True) for k, v in target.items()} for target in targets]
+    return [{k: v.to(device, non_blocking=non_blocking) for k, v in target.items()} for target in targets]
 
 
 def sum_loss_dict(losses: Mapping[str, Tensor]) -> Tensor:
@@ -852,6 +1010,7 @@ def train_one_epoch(
     wandb_run: Any | None = None,
 ) -> int:
     model.train()
+    set_data_loader_epoch(data_loader, epoch)
     optimizer.zero_grad(set_to_none=True)
     running: MutableMapping[str, list[float]] = defaultdict(list)
     progress = tqdm(data_loader, desc=f"train epoch={epoch}", disable=args.no_progress)
@@ -860,8 +1019,8 @@ def train_one_epoch(
     for batch_idx, (images, targets) in enumerate(progress):
         if args.limit_train_batches and batch_idx >= args.limit_train_batches:
             break
-        images = [image.to(device, non_blocking=True) for image in images]
-        targets = move_targets_to_device(targets, device)
+        images = images_to_device(images, device, non_blocking=args.pin_memory)
+        targets = move_targets_to_device(targets, device, non_blocking=args.pin_memory)
         lambda_gt = ilsd_lambda(global_step, total_steps, args.ilsd_decay_steps)
         student_loops = sample_student_loops(args.elt_min_loops, args.elt_max_loops)
 
@@ -930,6 +1089,14 @@ def train_one_epoch(
                     "elt/student_loops": student_loops,
                 }
             )
+            if device.type == "cuda":
+                payload.update(
+                    {
+                        "system/cuda_allocated_gb": torch.cuda.memory_allocated(device) / 1024**3,
+                        "system/cuda_reserved_gb": torch.cuda.memory_reserved(device) / 1024**3,
+                        "system/cuda_max_allocated_gb": torch.cuda.max_memory_allocated(device) / 1024**3,
+                    }
+                )
             wandb_run.log(payload)
 
         progress.set_postfix(
@@ -1076,8 +1243,48 @@ def parse_args() -> argparse.Namespace:
 
     # Optimization.
     parser.add_argument("--epochs", type=int, default=12)
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=2,
+        help="Per-step micro-batch size. Use --effective-batch-size for larger effective batches.",
+    )
+    parser.add_argument(
+        "--effective-batch-size",
+        type=int,
+        default=0,
+        help="If >0, set grad accumulation to ceil(effective_batch_size / batch_size).",
+    )
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--val-batch-size", type=int, default=1)
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=1,
+        help="Batches prefetched per worker. Keep low for large variable-size masks.",
+    )
+    parser.add_argument(
+        "--pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Opt in only when host shared memory is large enough.",
+    )
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--dataloader-start-method", choices=("default", "fork", "forkserver", "spawn"), default="default"
+    )
+    parser.add_argument(
+        "--sharing-strategy", choices=("default", "file_descriptor", "file_system"), default="file_system"
+    )
+    parser.add_argument(
+        "--return-uint8-images",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Return uint8 images from workers and normalize on the training device.",
+    )
+    parser.add_argument("--aspect-ratio-grouping", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--cudnn-benchmark", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--matmul-precision", choices=("highest", "high", "medium"), default="high")
     parser.add_argument("--lr", type=float, default=2.5e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--betas", default="0.9,0.999")
@@ -1201,6 +1408,22 @@ def main() -> None:
     set_seed(args.seed)
     device = choose_device(args.device)
     args.amp = bool(args.amp and device.type == "cuda")
+    if args.effective_batch_size > 0:
+        args.grad_accum_steps = max(1, math.ceil(args.effective_batch_size / max(1, args.batch_size)))
+    if args.sharing_strategy != "default":
+        torch.multiprocessing.set_sharing_strategy(args.sharing_strategy)
+    if args.batch_size > 8 and args.effective_batch_size <= 0:
+        print(
+            "Warning: --batch-size is a per-step Mask R-CNN micro-batch. "
+            "For an effective batch of 64, prefer --batch-size 2 --effective-batch-size 64.",
+            flush=True,
+        )
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = bool(args.cudnn_benchmark)
+    try:
+        torch.set_float32_matmul_precision(args.matmul_precision)
+    except Exception:
+        pass
 
     run_paths = make_run_paths(args.output_dir)
     (run_paths.output_dir / "resolved_config.json").write_text(
@@ -1213,12 +1436,14 @@ def main() -> None:
         ann_file=args.train_json,
         image_list=args.train_list,
         transform=RandomHorizontalFlipForDetection(args.hflip_prob),
+        return_uint8_images=args.return_uint8_images,
     )
     val_dataset = CocoInstanceSegmentation(
         image_dir=args.val_image_dir,
         ann_file=args.val_json,
         image_list=None,
         transform=None,
+        return_uint8_images=args.return_uint8_images,
     )
 
     if train_dataset.cat_ids != val_dataset.cat_ids:
@@ -1227,23 +1452,27 @@ def main() -> None:
             "and original COCO2017 validation annotations with the same categories."
         )
 
-    train_loader = DataLoader(
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(args.seed)
+    train_loader = make_detection_loader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        collate_fn=detection_collate,
-        persistent_workers=args.num_workers > 0,
+        device=device,
+        args=args,
+        generator=loader_generator,
+        aspect_ratio_grouping=args.aspect_ratio_grouping,
     )
-    val_loader = DataLoader(
+    val_loader = make_detection_loader(
         val_dataset,
-        batch_size=1,
+        batch_size=args.val_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        collate_fn=detection_collate,
-        persistent_workers=args.num_workers > 0,
+        device=device,
+        args=args,
+        generator=None,
+        aspect_ratio_grouping=False,
     )
 
     num_classes = len(train_dataset.cat_ids) + 1
@@ -1270,6 +1499,15 @@ def main() -> None:
                 "num_classes_including_background": num_classes,
                 "device": str(device),
                 "amp": args.amp,
+                "micro_batch_size": args.batch_size,
+                "effective_batch_size": args.batch_size * args.grad_accum_steps,
+                "grad_accum_steps": args.grad_accum_steps,
+                "num_workers": args.num_workers,
+                "prefetch_factor": args.prefetch_factor if args.num_workers > 0 else None,
+                "pin_memory": bool(args.pin_memory and device.type == "cuda"),
+                "sharing_strategy": torch.multiprocessing.get_sharing_strategy(),
+                "return_uint8_images": args.return_uint8_images,
+                "aspect_ratio_grouping": args.aspect_ratio_grouping,
                 "train_list": str(args.train_list) if args.train_list else None,
                 "eval_loop_budgets": eval_loop_budgets,
             },

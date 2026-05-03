@@ -192,13 +192,29 @@ ELT_MODEL ?= maskrcnn_resnet50_fpn_v2
 ELT_INIT ?= none
 ELT_DEVICE ?= cuda
 ELT_EPOCHS ?= 12
-ELT_BATCH_SIZE ?= 2
-ELT_NUM_WORKERS ?= 4
+# ELT_BATCH_SIZE is now the effective batch size. The actual Mask R-CNN
+# micro-batch is ELT_MICRO_BATCH_SIZE, with gradient accumulation filling the gap.
+ELT_BATCH_SIZE ?= 64
+ELT_MICRO_BATCH_SIZE ?= 2
+ELT_EFFECTIVE_BATCH_SIZE ?= $(ELT_BATCH_SIZE)
+ELT_VAL_BATCH_SIZE ?= 1
+ELT_NUM_WORKERS ?= 8
+ELT_PREFETCH_FACTOR ?= 1
+ELT_PIN_MEMORY ?= false
+ELT_PERSISTENT_WORKERS ?= true
+ELT_SHARING_STRATEGY ?= file_system
+ELT_ASPECT_RATIO_GROUPING ?= true
+ELT_MIN_SIZE ?= 800
+ELT_MAX_SIZE ?= 1333
+ELT_VALIDATE_EVERY ?= 5
 ELT_LR ?= 2.5e-4
 ELT_WEIGHT_DECAY ?= 1e-4
 ELT_MIN_LOOPS ?= 1
 ELT_MAX_LOOPS ?= 4
-ELT_EVAL_LOOPS ?= 1,2,4
+# Keep training-time validation cheap. Use ELT_EVAL_LOOPS=1,2,4 for a loop-budget sweep.
+ELT_EVAL_LOOPS ?= 4
+ELT_LEVELS ?= 1,2,3,pool
+ELT_FFN_DIM ?= 1024
 ELT_WANDB_PROJECT ?= elt-coco-copy-paste
 ELT_WANDB_LOG_IMAGES ?= 8
 ELT_WANDB_TOP_K ?= 15
@@ -206,6 +222,10 @@ ELT_RESUME ?=
 ELT_LIMIT_TRAIN_BATCHES ?= 0
 ELT_LIMIT_VAL_BATCHES ?= 0
 ELT_ARGS ?=
+
+ELT_PIN_MEMORY_ARG = $(if $(filter true 1 yes on,$(ELT_PIN_MEMORY)),--pin-memory,--no-pin-memory)
+ELT_PERSISTENT_WORKERS_ARG = $(if $(filter false 0 no off,$(ELT_PERSISTENT_WORKERS)),--no-persistent-workers,--persistent-workers)
+ELT_ASPECT_RATIO_GROUPING_ARG = $(if $(filter false 0 no off,$(ELT_ASPECT_RATIO_GROUPING)),--no-aspect-ratio-grouping,--aspect-ratio-grouping)
 
 ELT_COMMON_ARGS = \
 	--train-root "$(ELT_DATA)" \
@@ -220,14 +240,26 @@ ELT_COMMON_ARGS = \
 	--init $(ELT_INIT) \
 	--device $(ELT_DEVICE) \
 	--epochs $(ELT_EPOCHS) \
-	--batch-size $(ELT_BATCH_SIZE) \
+	--batch-size $(ELT_MICRO_BATCH_SIZE) \
+	--effective-batch-size $(ELT_EFFECTIVE_BATCH_SIZE) \
+	--val-batch-size $(ELT_VAL_BATCH_SIZE) \
 	--num-workers $(ELT_NUM_WORKERS) \
+	--prefetch-factor $(ELT_PREFETCH_FACTOR) \
+	$(ELT_PIN_MEMORY_ARG) \
+	$(ELT_PERSISTENT_WORKERS_ARG) \
+	--sharing-strategy $(ELT_SHARING_STRATEGY) \
+	$(ELT_ASPECT_RATIO_GROUPING_ARG) \
+	--min-size $(ELT_MIN_SIZE) \
+	--max-size $(ELT_MAX_SIZE) \
+	--validate-every $(ELT_VALIDATE_EVERY) \
 	--lr $(ELT_LR) \
 	--weight-decay $(ELT_WEIGHT_DECAY) \
 	--use-elt \
 	--ilsd \
 	--elt-min-loops $(ELT_MIN_LOOPS) \
 	--elt-max-loops $(ELT_MAX_LOOPS) \
+	--elt-levels $(ELT_LEVELS) \
+	--elt-ffn-dim $(ELT_FFN_DIM) \
 	--eval-loop-budgets $(ELT_EVAL_LOOPS) \
 	--output-dir "$(ELT_OUTPUT_DIR)" \
 	--wandb \
@@ -297,6 +329,8 @@ eltseg-smoke:
 		WANDB_MODE=offline \
 		ELT_EPOCHS=1 \
 		ELT_BATCH_SIZE=1 \
+		ELT_MICRO_BATCH_SIZE=1 \
+		ELT_EFFECTIVE_BATCH_SIZE=1 \
 		ELT_NUM_WORKERS=0 \
 		ELT_WANDB_LOG_IMAGES=2 \
 		ELT_LIMIT_TRAIN_BATCHES=2 \
