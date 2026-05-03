@@ -42,10 +42,12 @@ class AugmentationsConfig:
 class DatasetConfig:
     name: str = "coco2017"
     root: str = "data.nosync/raw/coco2017"
+    val_root: Any = None
     train_images: str = "train2017"
     val_images: str = "val2017"
     train_json: str = "annotations/instances_train2017.json"
     val_json: str = "annotations/instances_val2017.json"
+    train_image_set: str = "all"
     task: str = "segment"
     imgsz: int = 640
     batch_size: int = 12
@@ -111,6 +113,7 @@ class TrainingConfig:
     warmup_bias_lr: float = 0.1
     nbs: int = 64
     log_every_n_steps: int = 20
+    check_val_every_n_epoch: int = 1
     limit_train_batches: float = 1.0
     limit_val_batches: float = 1.0
     resume_from_checkpoint: Any = None

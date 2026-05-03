@@ -105,6 +105,7 @@ def build_trainer(cfg: Config, wandb_logger: WandbLogger | None, default_root_di
         logger=wandb_logger,
         callbacks=callbacks,
         log_every_n_steps=cfg.training.log_every_n_steps,
+        check_val_every_n_epoch=int(getattr(cfg.training, "check_val_every_n_epoch", 1)),
         limit_train_batches=cfg.training.limit_train_batches,
         limit_val_batches=cfg.training.limit_val_batches,
         deterministic=bool(cfg.debug),

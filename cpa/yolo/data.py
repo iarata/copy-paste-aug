@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import asdict, is_dataclass
+import hashlib
 import json
 import math
 import os
@@ -43,7 +44,9 @@ from ultralytics.utils.tqdm import TQDM
 import yaml
 
 from cpa.augs.copy_paste import extract_bboxes, image_copy_paste
-from cpa.utils.dataset_subset import subset_sequence, validate_subset_percent, write_coco_subset_json
+from cpa.utils.dataset_subset import subset_coco, subset_sequence, validate_subset_percent
+
+TRAIN_IMAGE_SETS = {"all", "original", "augmented", "generated"}
 
 
 def _cfg_to_dict(cfg: Any) -> Any:
@@ -59,6 +62,118 @@ def _cfg_to_dict(cfg: Any) -> Any:
 def resolve_path(path: str | Path, base: str | Path) -> Path:
     candidate = Path(path)
     return candidate if candidate.is_absolute() else Path(base) / candidate
+
+
+def resolve_dataset_path(path: str | Path, base: str | Path, fallback_base: str | Path | None = None) -> Path:
+    candidate = resolve_path(path, base)
+    if candidate.exists() or fallback_base is None:
+        return candidate
+
+    fallback = resolve_path(path, fallback_base)
+    return fallback if fallback.exists() else candidate
+
+
+def normalize_train_image_set(train_image_set: str) -> str:
+    normalized = str(train_image_set).lower()
+    if normalized not in TRAIN_IMAGE_SETS:
+        choices = ", ".join(sorted(TRAIN_IMAGE_SETS))
+        raise ValueError(f"Unsupported train_image_set={train_image_set!r}. Expected one of: {choices}.")
+    return "augmented" if normalized == "generated" else normalized
+
+
+def read_image_list(path: str | Path) -> list[str]:
+    list_path = Path(path)
+    if not list_path.exists():
+        raise FileNotFoundError(
+            f"Expected premade image list at {list_path}. "
+            "Use dataset.train_image_set=all to train from dataset.train_json without list filtering."
+        )
+
+    entries = [line.strip() for line in list_path.read_text(encoding="utf-8").splitlines()]
+    entries = [entry for entry in entries if entry]
+    if not entries:
+        raise ValueError(f"Premade image list is empty: {list_path}")
+    return entries
+
+
+def _image_file_keys(file_name: str) -> set[str]:
+    normalized = str(file_name).replace("\\", "/")
+    keys = {normalized}
+    basename = Path(normalized).name
+    if basename:
+        keys.add(basename)
+    return keys
+
+
+def _normalize_image_files(image_files: list[str] | set[str] | None) -> set[str] | None:
+    if image_files is None:
+        return None
+
+    normalized: set[str] = set()
+    for file_name in image_files:
+        normalized.update(_image_file_keys(file_name))
+    return normalized
+
+
+def _image_file_filter_hash(image_files: set[str] | None) -> str:
+    if image_files is None:
+        return ""
+
+    digest = hashlib.sha1()
+    for file_name in sorted(image_files):
+        digest.update(file_name.encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _image_info_matches_filter(image_info: dict[str, Any], image_files: set[str] | None) -> bool:
+    if image_files is None:
+        return True
+    return bool(_image_file_keys(str(image_info.get("file_name", ""))) & image_files)
+
+
+def filter_coco_by_image_files(coco: dict[str, Any], image_files: set[str] | None) -> dict[str, Any]:
+    if image_files is None:
+        return coco
+
+    images = [
+        image_info
+        for image_info in coco.get("images", [])
+        if _image_info_matches_filter(image_info, image_files)
+    ]
+    selected_image_ids = {image["id"] for image in images}
+    annotations = [
+        annotation
+        for annotation in coco.get("annotations", [])
+        if annotation.get("image_id") in selected_image_ids
+    ]
+    return {
+        **coco,
+        "images": images,
+        "annotations": annotations,
+    }
+
+
+def write_coco_filtered_subset_json(
+    source_json: str | Path,
+    output_json: str | Path,
+    *,
+    image_files: set[str] | None,
+    percent: float,
+    seed: int,
+) -> Path:
+    source_path = Path(source_json)
+    output_path = Path(output_json)
+    with source_path.open("r", encoding="utf-8") as handle:
+        coco = json.load(handle)
+
+    coco = filter_coco_by_image_files(coco, image_files)
+    if percent < 100.0:
+        coco = subset_coco(coco, percent, seed)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(coco, separators=(",", ":")), encoding="utf-8")
+    return output_path
 
 
 def load_coco_names(json_file: str | Path) -> dict[int, str]:
@@ -116,7 +231,9 @@ class RectBatchDistributedSampler(DistributedSampler):
         )
         self.batch_size = max(int(batch_size), 1)
         self.source_batches = math.ceil(len(dataset) / self.batch_size)
-        self.batches_per_rank = math.ceil(self.source_batches / self.num_replicas) if self.source_batches else 0
+        self.batches_per_rank = (
+            math.ceil(self.source_batches / self.num_replicas) if self.source_batches else 0
+        )
         self.num_samples = self.batches_per_rank * self.batch_size
         self.total_size = self.num_samples * self.num_replicas
 
@@ -128,7 +245,9 @@ class RectBatchDistributedSampler(DistributedSampler):
         if self.shuffle:
             generator = torch.Generator()
             generator.manual_seed(self.seed + self.epoch)
-            batch_ids = [batch_ids[index] for index in torch.randperm(len(batch_ids), generator=generator).tolist()]
+            batch_ids = [
+                batch_ids[index] for index in torch.randperm(len(batch_ids), generator=generator).tolist()
+            ]
 
         total_batches = self.batches_per_rank * self.num_replicas
         padding = total_batches - len(batch_ids)
@@ -447,12 +566,15 @@ class COCOJsonDataset(YOLODataset):
         *args: Any,
         json_file: str,
         augmentation_cfg: Any,
+        image_files: list[str] | set[str] | None = None,
         subset_percent: float = 100.0,
         subset_seed: int = 0,
         **kwargs: Any,
     ) -> None:
         self.json_file = str(json_file)
         self.augmentation_cfg = augmentation_cfg
+        self.image_files = _normalize_image_files(image_files)
+        self.image_file_filter_hash = _image_file_filter_hash(self.image_files)
         self.subset_percent = validate_subset_percent(subset_percent)
         self.subset_seed = int(subset_seed)
         super().__init__(*args, **kwargs)
@@ -475,7 +597,15 @@ class COCOJsonDataset(YOLODataset):
         for annotation in coco["annotations"]:
             annotations_by_image[annotation["image_id"]].append(annotation)
 
-        image_infos = subset_sequence(list(coco["images"]), self.subset_percent, self.subset_seed)
+        image_infos = [
+            image_info
+            for image_info in coco["images"]
+            if _image_info_matches_filter(image_info, self.image_files)
+        ]
+        if self.image_files is not None and not image_infos:
+            raise ValueError(f"No images in {self.json_file} matched the configured premade image list.")
+
+        image_infos = subset_sequence(image_infos, self.subset_percent, self.subset_seed)
         for image_info in TQDM(image_infos, desc=f"reading {Path(self.json_file).name}"):
             height, width = image_info["height"], image_info["width"]
             image_file = Path(self.img_path) / image_info["file_name"]
@@ -534,18 +664,35 @@ class COCOJsonDataset(YOLODataset):
             )
 
         cache["hash"] = get_hash(
-            [self.json_file, str(self.img_path), str(self.subset_percent), str(self.subset_seed)]
+            [
+                self.json_file,
+                str(self.img_path),
+                self.image_file_filter_hash,
+                str(self.subset_percent),
+                str(self.subset_seed),
+            ]
         )
         save_dataset_cache_file(self.prefix, path, cache, DATASET_CACHE_VERSION)
         return cache
 
     def get_labels(self) -> list[dict[str, Any]]:
-        cache_path = Path(self.json_file).with_suffix(".cache")
+        json_path = Path(self.json_file)
+        cache_path = json_path.with_suffix(".cache")
+        if self.image_files is not None:
+            cache_path = json_path.with_name(
+                f"{json_path.stem}.filter_{self.image_file_filter_hash[:12]}.cache"
+            )
         try:
             cache = load_dataset_cache_file(cache_path)
             assert cache["version"] == DATASET_CACHE_VERSION
             assert cache["hash"] == get_hash(
-                [self.json_file, str(self.img_path), str(self.subset_percent), str(self.subset_seed)]
+                [
+                    self.json_file,
+                    str(self.img_path),
+                    self.image_file_filter_hash,
+                    str(self.subset_percent),
+                    str(self.subset_seed),
+                ]
             )
             self.im_files = [label["im_file"] for label in cache["labels"]]
         except (FileNotFoundError, AssertionError, AttributeError, KeyError, ModuleNotFoundError):
@@ -591,13 +738,17 @@ class COCOJsonDataModule(L.LightningDataModule):
         self.project_root = project_root
         self.seed = int(seed)
         self.root = resolve_path(cfg.root, project_root)
-        self.train_json = resolve_path(cfg.train_json, self.root)
-        self.val_json = resolve_path(cfg.val_json, self.root)
-        self.train_images = resolve_path(cfg.train_images, self.root)
-        self.val_images = resolve_path(cfg.val_images, self.root)
+        self.train_image_set = normalize_train_image_set(getattr(cfg, "train_image_set", "all"))
+        val_root = getattr(cfg, "val_root", None)
+        self.val_root = resolve_path(val_root, project_root) if val_root else self.root
+        self.train_json = resolve_dataset_path(cfg.train_json, self.root, project_root)
+        self.val_json = resolve_dataset_path(cfg.val_json, self.val_root, project_root)
+        self.train_images = resolve_dataset_path(cfg.train_images, self.root, project_root)
+        self.val_images = resolve_dataset_path(cfg.val_images, self.val_root, project_root)
         self.eval_batch_size = eval_batch_size or cfg.batch_size
         self.train_subset_percent = validate_subset_percent(getattr(cfg, "train_subset_percent", 100.0))
         self.val_subset_percent = validate_subset_percent(getattr(cfg, "val_subset_percent", 100.0))
+        self.train_image_files = self._load_train_image_files()
         self.names = load_coco_names(self.train_json)
         self.data = {
             "path": str(self.root),
@@ -605,16 +756,23 @@ class COCOJsonDataModule(L.LightningDataModule):
             "val": str(self.val_images),
             "train_json": str(self.train_json),
             "val_json": str(self.val_json),
+            "val_root": str(self.val_root),
             "nc": len(self.names),
             "names": self.names,
             "channels": 3,
             "coco_eval": bool(getattr(cfg, "coco_eval", False)),
+            "train_image_set": self.train_image_set,
             "train_subset_percent": self.train_subset_percent,
             "val_subset_percent": self.val_subset_percent,
         }
         self.hyp = build_yolo_hyp(cfg.augmentations)
         self.train_dataset: COCOJsonDataset | None = None
         self.val_dataset: COCOJsonDataset | None = None
+
+    def _load_train_image_files(self) -> list[str] | None:
+        if self.train_image_set == "all":
+            return None
+        return read_image_list(self.root / "lists" / f"train_{self.train_image_set}.txt")
 
     def setup(self, stage: str | None = None) -> None:
         if stage in {None, "fit"}:
@@ -636,6 +794,7 @@ class COCOJsonDataModule(L.LightningDataModule):
                 data=self.data,
                 task=self.cfg.task,
                 augmentation_cfg=self.cfg.augmentations,
+                image_files=self.train_image_files,
                 subset_percent=self.train_subset_percent,
                 subset_seed=self.seed,
             )
@@ -729,12 +888,16 @@ class COCOJsonDataModule(L.LightningDataModule):
             output_path.parent,
             split="train",
             subset_percent=self.train_subset_percent,
+            image_files=_normalize_image_files(self.train_image_files),
+            image_filter_label=self.train_image_set if self.train_image_files is not None else None,
         )
         val_json = self._data_yaml_json_path(
             self.val_json,
             output_path.parent,
             split="val",
             subset_percent=self.val_subset_percent,
+            image_files=None,
+            image_filter_label=None,
         )
         payload = {
             "path": str(self.root),
@@ -759,15 +922,23 @@ class COCOJsonDataModule(L.LightningDataModule):
         *,
         split: str,
         subset_percent: float,
+        image_files: set[str] | None,
+        image_filter_label: str | None,
     ) -> Path:
-        if subset_percent >= 100.0:
+        if subset_percent >= 100.0 and image_files is None:
             return source_json
 
         percent_label = f"{subset_percent:g}".replace(".", "p")
-        output_json = output_dir / f"{source_json.stem}.{split}_subset_{percent_label}pct_seed{self.seed}.json"
-        return write_coco_subset_json(
+        suffix_parts = [split]
+        if image_filter_label:
+            suffix_parts.append(image_filter_label)
+        if subset_percent < 100.0:
+            suffix_parts.append(f"subset_{percent_label}pct_seed{self.seed}")
+        output_json = output_dir / f"{source_json.stem}.{'.'.join(suffix_parts)}.json"
+        return write_coco_filtered_subset_json(
             source_json,
             output_json,
+            image_files=image_files,
             percent=subset_percent,
             seed=self.seed,
         )

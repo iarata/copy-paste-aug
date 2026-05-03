@@ -53,6 +53,10 @@ def _annotation(ann_id: int, image_id: int) -> dict[str, object]:
     }
 
 
+def _write_coco_json(path: Path, payload: dict[str, object]) -> None:
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
 def _variable_coco_root(tmp_path: Path) -> Path:
     root = tmp_path / "coco2017_rect"
     (root / "train2017").mkdir(parents=True)
@@ -91,13 +95,11 @@ def _variable_coco_root(tmp_path: Path) -> Path:
             _image_record(image_id, height=height, width=width)
             for image_id, (height, width) in zip(range(100, 110), val_shapes, strict=True)
         ],
-        "annotations": [
-            _annotation(index + 100, image_id) for index, image_id in enumerate(range(100, 110))
-        ],
+        "annotations": [_annotation(index + 100, image_id) for index, image_id in enumerate(range(100, 110))],
         "categories": _categories(),
     }
-    (root / "annotations" / "instances_train2017.json").write_text(json.dumps(train_json), encoding="utf-8")
-    (root / "annotations" / "instances_val2017.json").write_text(json.dumps(val_json), encoding="utf-8")
+    _write_coco_json(root / "annotations" / "instances_train2017.json", train_json)
+    _write_coco_json(root / "annotations" / "instances_val2017.json", val_json)
     return root
 
 
@@ -131,8 +133,46 @@ def coco_root(tmp_path: Path) -> Path:
         "annotations": [_annotation(100 + index, image_id) for index, image_id in enumerate(val_ids)],
         "categories": _categories(),
     }
-    (root / "annotations" / "instances_train2017.json").write_text(json.dumps(train_json), encoding="utf-8")
-    (root / "annotations" / "instances_val2017.json").write_text(json.dumps(val_json), encoding="utf-8")
+    _write_coco_json(root / "annotations" / "instances_train2017.json", train_json)
+    _write_coco_json(root / "annotations" / "instances_val2017.json", val_json)
+    return root
+
+
+def _add_premade_augmented_image(coco_root: Path) -> str:
+    generated_name = "simple_cp_seed42_base000000000001_000_generated.jpg"
+    rng = np.random.default_rng(42)
+    Image.fromarray(rng.integers(0, 255, (128, 128, 3), dtype=np.uint8)).save(
+        coco_root / "train2017" / generated_name
+    )
+
+    train_json_path = coco_root / "annotations" / "instances_train2017.json"
+    train_json = json.loads(train_json_path.read_text(encoding="utf-8"))
+    train_json["images"].append({"id": 1001, "file_name": generated_name, "height": 128, "width": 128})
+    train_json["annotations"].append(_annotation(1001, 1001))
+    _write_coco_json(train_json_path, train_json)
+
+    lists_dir = coco_root / "lists"
+    lists_dir.mkdir()
+    (lists_dir / "train_original.txt").write_text("000000000001.jpg\n000000000002.jpg\n", encoding="utf-8")
+    (lists_dir / "train_augmented.txt").write_text(f"{generated_name}\n", encoding="utf-8")
+    (lists_dir / "train_all.txt").write_text(
+        f"000000000001.jpg\n000000000002.jpg\n{generated_name}\n",
+        encoding="utf-8",
+    )
+    return generated_name
+
+
+def _single_val_root(tmp_path: Path) -> Path:
+    root = tmp_path / "original_coco2017"
+    (root / "val2017").mkdir(parents=True)
+    (root / "annotations").mkdir(parents=True)
+    Image.fromarray(np.full((128, 128, 3), 127, dtype=np.uint8)).save(root / "val2017" / f"{77:012d}.jpg")
+    val_json = {
+        "images": [_image_record(77)],
+        "annotations": [_annotation(77, 77)],
+        "categories": _categories(),
+    }
+    _write_coco_json(root / "annotations" / "instances_val2017.json", val_json)
     return root
 
 
@@ -205,6 +245,43 @@ def test_datamodule_applies_subset_percent(coco_root: Path):
     assert datamodule.val_dataset is not None
     assert len(datamodule.train_dataset) == 1
     assert len(datamodule.val_dataset) == 1
+
+
+def test_datamodule_filters_premade_augmented_train_images(coco_root: Path, tmp_path: Path):
+    generated_name = _add_premade_augmented_image(coco_root)
+    cfg = _config(coco_root, aug_name="none")
+    cfg.dataset.train_image_set = "augmented"
+
+    datamodule = COCOJsonDataModule(cfg.dataset, project_root=Path.cwd(), seed=cfg.seed)
+    datamodule.setup("fit")
+
+    assert datamodule.train_dataset is not None
+    assert len(datamodule.train_dataset) == 1
+    assert Path(datamodule.train_dataset.im_files[0]).name == generated_name
+
+    data_yaml = datamodule.write_data_yaml(tmp_path / "eval" / "coco_data.yaml")
+    payload = yaml.safe_load(data_yaml.read_text(encoding="utf-8"))
+    with Path(payload["train_json"]).open("r", encoding="utf-8") as handle:
+        filtered_coco = json.load(handle)
+
+    assert [image["file_name"] for image in filtered_coco["images"]] == [generated_name]
+    assert {annotation["image_id"] for annotation in filtered_coco["annotations"]} == {1001}
+
+
+def test_datamodule_can_validate_from_separate_coco_root(coco_root: Path, tmp_path: Path):
+    val_root = _single_val_root(tmp_path)
+    cfg = _config(coco_root, aug_name="none")
+    cfg.dataset.val_root = str(val_root)
+    cfg.dataset.val_images = "val2017"
+    cfg.dataset.val_json = "annotations/instances_val2017.json"
+
+    datamodule = COCOJsonDataModule(cfg.dataset, project_root=Path.cwd(), seed=cfg.seed)
+    datamodule.setup("validate")
+
+    assert datamodule.val_root == val_root
+    assert datamodule.val_dataset is not None
+    assert len(datamodule.val_dataset) == 1
+    assert Path(datamodule.val_dataset.im_files[0]).parent == val_root / "val2017"
 
 
 def test_data_yaml_uses_subset_annotation_json(tmp_path: Path):
@@ -387,6 +464,15 @@ def test_debug_builds_fast_dev_run_trainer(coco_root: Path, tmp_path: Path):
     trainer = build_trainer(cfg, wandb_logger=None, default_root_dir=tmp_path)
 
     assert trainer.fast_dev_run == 1
+
+
+def test_build_trainer_respects_validation_epoch_cadence(coco_root: Path, tmp_path: Path):
+    cfg = _config(coco_root, aug_name="none")
+    cfg.training.check_val_every_n_epoch = 5
+
+    trainer = build_trainer(cfg, wandb_logger=None, default_root_dir=tmp_path)
+
+    assert trainer.check_val_every_n_epoch == 5
 
 
 def test_resolve_precision_prefers_bfloat16_when_supported(monkeypatch: pytest.MonkeyPatch):

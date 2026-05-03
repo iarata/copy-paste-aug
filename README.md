@@ -103,12 +103,19 @@ and disable online augmentation:
 ```bash
 make train ARGS="\
   dataset.root=data.nosync/processed/coco2017_simple_cp_seed42_sub50 \
+  dataset.val_root=data.nosync/raw/coco2017 \
+  dataset.train_image_set=augmented \
   dataset.train_json=annotations/instances_train2017.json \
   dataset.val_json=annotations/instances_val2017.json \
   dataset.train_images=train2017 \
   dataset.val_images=val2017 \
-  dataset.augmentations.name=none"
+  dataset.augmentations.name=none \
+  training.check_val_every_n_epoch=5"
 ```
+
+Use `dataset.train_image_set=original|augmented|all` to select the premade
+`lists/train_*.txt` split. `augmented` trains only on generated copy-paste
+images while `dataset.val_root` keeps validation on the original COCO2017 root.
 
 The generator is method-registry based (`--method simple|harmonized`), so additional
 offline copy-paste methods can be added without changing the CLI contract.

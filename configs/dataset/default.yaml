@@ -4,10 +4,12 @@ defaults:
 
 name: coco2017
 root: data.nosync/raw/coco2017
+val_root: null
 train_images: train2017
 val_images: val2017
 train_json: annotations/instances_train2017.json
 val_json: annotations/instances_val2017.json
+train_image_set: all
 task: segment
 imgsz: 640
 batch_size: 12
